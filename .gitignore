@@ -1,0 +1,12 @@
+.build/
+build/
+*.xcodeproj
+.swiftpm/
+.DS_Store
+.env
+.env.*
+!.env.example
+.agents/
+.codex/
+.claude/
+memory/

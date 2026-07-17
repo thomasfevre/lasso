@@ -1,0 +1,943 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Lasso turns a deliberate rectangular screen capture into visual context your AI coding agent can inspect."
+    />
+    <meta name="theme-color" content="#f7f7f5" />
+    <title>Lasso — Visual context for AI agents</title>
+    <style>
+      :root {
+        --ink: #151414;
+        --surface: #ffffff;
+        --surface-soft: #f5f5f5;
+        --copy: #504b45;
+        --amber: #dfb574;
+        --amber-deep: #7b4a20;
+        --amber-ink: #241706;
+        --night: #111014;
+        --night-copy: #cbc5bc;
+        --line: rgba(21, 20, 20, 0.14);
+        --line-dark: rgba(247, 247, 245, 0.17);
+        --max: 1320px;
+        --gutter: clamp(24px, 5vw, 72px);
+        --ease: cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        background: var(--surface);
+        color: var(--ink);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+          Arial, sans-serif;
+        font-size: 17px;
+        line-height: 1.55;
+        margin: 0;
+        overflow-x: hidden;
+      }
+
+      body,
+      button,
+      a {
+        font: inherit;
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      img {
+        display: block;
+        height: auto;
+        max-width: 100%;
+      }
+
+      h1,
+      h2,
+      h3,
+      p,
+      figure {
+        margin-top: 0;
+      }
+
+      h1,
+      h2,
+      h3 {
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+          "Helvetica Neue", Arial, sans-serif;
+        text-wrap: balance;
+      }
+
+      p {
+        text-wrap: pretty;
+      }
+
+      :focus-visible {
+        outline: 3px solid currentColor;
+        outline-offset: 4px;
+      }
+
+      .shell {
+        margin: 0 auto;
+        max-width: var(--max);
+        padding-left: var(--gutter);
+        padding-right: var(--gutter);
+      }
+
+      .nav {
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        justify-content: space-between;
+        min-height: 80px;
+        position: relative;
+        z-index: 5;
+      }
+
+      .wordmark {
+        align-items: center;
+        display: inline-flex;
+        font-size: 17px;
+        font-weight: 750;
+        gap: 9px;
+        letter-spacing: -0.025em;
+      }
+
+      .mark {
+        align-items: center;
+        background: var(--amber);
+        border-radius: 5px;
+        color: var(--amber-ink);
+        display: inline-flex;
+        font-size: 14px;
+        font-weight: 900;
+        height: 24px;
+        justify-content: center;
+        width: 24px;
+      }
+
+      .nav-links {
+        align-items: center;
+        display: flex;
+        gap: clamp(18px, 2.2vw, 30px);
+      }
+
+      .nav-links > a:not(.button) {
+        color: var(--copy);
+        font-size: 16px;
+        font-weight: 600;
+      }
+
+      .button {
+        align-items: center;
+        background: var(--ink);
+        border: 0;
+        border-radius: 999px;
+        color: var(--surface);
+        cursor: pointer;
+        display: inline-flex;
+        font-size: 16px;
+        font-weight: 750;
+        justify-content: center;
+        min-height: 48px;
+        padding: 13px 22px;
+        transition:
+          background 220ms ease,
+          color 220ms ease,
+          transform 160ms var(--ease);
+      }
+
+      .button:active {
+        transform: scale(0.97);
+      }
+
+      .button.secondary {
+        background: transparent;
+        box-shadow: inset 0 0 0 1px #a69a89;
+        color: var(--ink);
+      }
+
+      @media (hover: hover) and (pointer: fine) {
+        .button:hover {
+          background: #2a2724;
+        }
+
+        .button.secondary:hover {
+          background: rgba(21, 20, 20, 0.06);
+        }
+
+        .nav-links > a:not(.button):hover,
+        footer a:hover {
+          color: var(--ink);
+        }
+      }
+
+      .hero {
+        min-height: calc(100svh - 80px);
+        padding-bottom: clamp(72px, 9vw, 120px);
+        position: relative;
+      }
+
+      .hero-grid {
+        align-items: center;
+        display: grid;
+        gap: clamp(42px, 5vw, 80px);
+        grid-template-columns: minmax(330px, 0.84fr) minmax(480px, 1.16fr);
+        margin-top: clamp(64px, 8vw, 108px);
+      }
+
+      .kicker {
+        color: var(--amber-deep);
+        display: block;
+        font-size: 16px;
+        font-weight: 660;
+        letter-spacing: -0.01em;
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        font-size: clamp(56px, 6vw, 82px);
+        font-weight: 690;
+        letter-spacing: -0.035em;
+        line-height: 0.99;
+        margin-bottom: 28px;
+        max-width: 600px;
+      }
+
+      .hero-copy > p {
+        color: var(--copy);
+        font-size: clamp(18px, 1.35vw, 20px);
+        line-height: 1.6;
+        max-width: 490px;
+      }
+
+      .actions {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 32px;
+      }
+
+      .hero-visual {
+        margin: 0;
+        position: relative;
+      }
+
+      .hero-media {
+        padding: 0;
+      }
+
+      .hero-frame {
+        background: transparent;
+      }
+
+      .hero-frame img {
+        filter: drop-shadow(0 24px 30px rgba(21, 17, 14, 0.16));
+        margin: 0 auto;
+        width: min(100%, 620px);
+      }
+
+      .process {
+        background: var(--surface-soft);
+        padding-bottom: clamp(96px, 12vw, 168px);
+        padding-top: clamp(96px, 12vw, 168px);
+      }
+
+      .process-head {
+        align-items: end;
+        display: grid;
+        gap: 42px;
+        grid-template-columns: 1fr minmax(280px, 0.42fr);
+        margin-bottom: clamp(70px, 8vw, 112px);
+      }
+
+      .process h2 {
+        font-size: clamp(44px, 4.8vw, 66px);
+        font-weight: 680;
+        letter-spacing: -0.035em;
+        line-height: 1.06;
+        margin-bottom: 0;
+      }
+
+      .process-head p {
+        color: var(--copy);
+        font-size: 18px;
+        line-height: 1.62;
+        margin-bottom: 0;
+      }
+
+      .steps {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        list-style: none;
+        margin: 0 0 72px;
+        padding: 0;
+      }
+
+      .steps li {
+        border-top: 1px solid rgba(21, 20, 20, 0.42);
+        padding: 28px 40px 0 0;
+      }
+
+      .steps li + li {
+        padding-left: 34px;
+      }
+
+      .steps b {
+        align-items: center;
+        border: 1px solid rgba(123, 74, 32, 0.55);
+        border-radius: 50%;
+        color: var(--amber-deep);
+        display: flex;
+        font-size: 15px;
+        height: 34px;
+        justify-content: center;
+        margin-bottom: 38px;
+        width: 34px;
+      }
+
+      .steps strong {
+        display: block;
+        font-size: 20px;
+        margin-bottom: 10px;
+      }
+
+      .steps span {
+        color: var(--copy);
+        font-size: 16px;
+        line-height: 1.55;
+      }
+
+      .annotation-stage {
+        background: var(--surface);
+        border-radius: 14px;
+        box-shadow: 0 28px 70px rgba(23, 20, 18, 0.12);
+        margin: 0 auto;
+        max-width: 930px;
+        padding: clamp(14px, 2vw, 24px);
+      }
+
+      .annotation-stage img {
+        margin: 0 auto;
+        max-height: 820px;
+        width: auto;
+      }
+
+      .shot {
+        background: var(--night);
+        border-radius: 14px;
+        overflow: hidden;
+      }
+
+      .shot img {
+        width: 100%;
+      }
+
+      .library {
+        background: var(--night);
+        color: var(--surface);
+        overflow: hidden;
+        padding-bottom: clamp(90px, 12vw, 170px);
+        padding-top: clamp(90px, 12vw, 150px);
+      }
+
+      .library-head {
+        align-items: end;
+        display: grid;
+        gap: 40px;
+        grid-template-columns: 1fr minmax(280px, 0.48fr);
+        margin-bottom: clamp(45px, 7vw, 80px);
+      }
+
+      .library h2 {
+        font-size: clamp(44px, 5.3vw, 72px);
+        font-weight: 740;
+        letter-spacing: -0.035em;
+        line-height: 1.02;
+        margin-bottom: 0;
+        max-width: 850px;
+      }
+
+      .library-head p {
+        color: var(--night-copy);
+        font-size: 18px;
+        line-height: 1.62;
+        margin-bottom: 4px;
+      }
+
+      .history-stage {
+        margin: 0;
+        position: relative;
+      }
+
+      .history-stage::after {
+        background: var(--amber);
+        bottom: -17px;
+        content: "";
+        height: 3px;
+        left: 8%;
+        position: absolute;
+        width: 18%;
+      }
+
+      .history-stage img {
+        border-radius: 14px;
+        width: 100%;
+      }
+
+      .history-caption {
+        color: var(--night-copy);
+        display: flex;
+        font-size: 16px;
+        gap: 24px;
+        justify-content: space-between;
+        line-height: 1.5;
+        margin-top: 22px;
+      }
+
+      .history-caption strong {
+        color: var(--surface);
+      }
+
+      .workflow {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        margin-top: clamp(70px, 9vw, 118px);
+      }
+
+      .workflow div {
+        border-top: 1px solid var(--line-dark);
+        padding: 22px 28px 0 0;
+      }
+
+      .workflow div + div {
+        padding-left: 28px;
+      }
+
+      .workflow strong {
+        display: block;
+        font-size: 17px;
+        margin-bottom: 8px;
+      }
+
+      .workflow span {
+        color: var(--night-copy);
+        font-size: 16px;
+        line-height: 1.55;
+      }
+
+      .setup {
+        align-items: center;
+        display: grid;
+        gap: clamp(40px, 8vw, 120px);
+        grid-template-columns: minmax(420px, 1.18fr) minmax(280px, 0.82fr);
+        padding-bottom: clamp(90px, 12vw, 160px);
+        padding-top: clamp(90px, 12vw, 160px);
+      }
+
+      .setup-visual {
+        margin: 0;
+        position: relative;
+      }
+
+      .setup-visual .shot {
+        max-width: 650px;
+      }
+
+      .setup h2 {
+        font-size: clamp(40px, 4.3vw, 58px);
+        font-weight: 740;
+        letter-spacing: -0.035em;
+        line-height: 1.04;
+        margin-bottom: 24px;
+      }
+
+      .setup-copy > p {
+        color: var(--copy);
+        font-size: 18px;
+        line-height: 1.58;
+        max-width: 430px;
+      }
+
+      .clients {
+        border-bottom: 1px solid var(--line);
+        border-top: 1px solid var(--line);
+        display: flex;
+        flex-wrap: wrap;
+        font-size: 16px;
+        font-weight: 700;
+        gap: 10px 24px;
+        margin-top: 30px;
+        padding: 17px 0;
+      }
+
+      .privacy {
+        background: var(--amber);
+        color: var(--amber-ink);
+        padding-bottom: clamp(86px, 11vw, 150px);
+        padding-top: clamp(86px, 11vw, 150px);
+      }
+
+      .privacy-grid {
+        align-items: end;
+        display: grid;
+        gap: clamp(45px, 9vw, 140px);
+        grid-template-columns: minmax(300px, 1fr) minmax(280px, 0.58fr);
+      }
+
+      .privacy h2 {
+        font-size: clamp(46px, 5.7vw, 76px);
+        font-weight: 750;
+        letter-spacing: -0.035em;
+        line-height: 1;
+        margin: 0;
+        max-width: 750px;
+      }
+
+      .privacy-copy {
+        font-size: 18px;
+        line-height: 1.62;
+      }
+
+      .privacy-points {
+        margin-top: 28px;
+      }
+
+      .privacy-points div {
+        border-top: 1px solid rgba(36, 23, 6, 0.28);
+        padding: 16px 0;
+      }
+
+      .privacy-points div:last-child {
+        border-bottom: 1px solid rgba(36, 23, 6, 0.28);
+      }
+
+      .privacy-points strong {
+        display: block;
+        font-size: 16px;
+        margin-bottom: 4px;
+      }
+
+      .privacy-points span {
+        font-size: 16px;
+      }
+
+      .final {
+        padding-bottom: 52px;
+        padding-top: clamp(105px, 14vw, 190px);
+        text-align: center;
+      }
+
+      .final h2 {
+        font-size: clamp(48px, 6vw, 80px);
+        font-weight: 760;
+        letter-spacing: -0.035em;
+        line-height: 1;
+        margin: 0 auto 27px;
+        max-width: 880px;
+      }
+
+      .final > p {
+        color: var(--copy);
+        font-size: 19px;
+        line-height: 1.58;
+        margin: 0 auto 29px;
+        max-width: 480px;
+      }
+
+      footer {
+        border-top: 1px solid var(--line);
+        color: var(--copy);
+        display: flex;
+        font-size: 15px;
+        justify-content: space-between;
+        padding-bottom: 30px;
+        padding-top: 22px;
+      }
+
+      footer a {
+        text-decoration: underline;
+        text-underline-offset: 3px;
+      }
+
+      @media (max-width: 1060px) {
+        .hero {
+          min-height: auto;
+        }
+
+        .hero-grid,
+        .process-head,
+        .setup,
+        .privacy-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-grid {
+          margin-top: 78px;
+        }
+
+        .hero-copy {
+          max-width: 680px;
+        }
+
+        .hero-copy > p {
+          max-width: 520px;
+        }
+
+        .hero-visual {
+          margin-top: 20px;
+        }
+
+        .library-head {
+          align-items: start;
+          grid-template-columns: 1fr;
+        }
+
+        .library-head p {
+          max-width: 580px;
+        }
+
+        .setup-visual {
+          margin-bottom: 30px;
+          max-width: 720px;
+        }
+
+      }
+
+      @media (max-width: 680px) {
+        .nav-links > a:not(.button) {
+          display: none;
+        }
+
+        .nav .button {
+          font-size: 16px;
+          min-height: 44px;
+          padding: 11px 16px;
+        }
+
+        .hero-grid {
+          margin-top: 62px;
+        }
+
+        h1 {
+          font-size: clamp(48px, 13.5vw, 60px);
+        }
+
+        .shot,
+        .history-stage img {
+          border-radius: 10px;
+        }
+
+        .history-caption {
+          display: block;
+        }
+
+        .history-caption span {
+          display: block;
+          margin-top: 8px;
+        }
+
+        .workflow {
+          grid-template-columns: 1fr;
+        }
+
+        .steps {
+          grid-template-columns: 1fr;
+        }
+
+        .steps li,
+        .steps li + li {
+          padding: 22px 0 38px;
+        }
+
+        .steps b {
+          margin-bottom: 18px;
+        }
+
+        .workflow div + div {
+          margin-top: 28px;
+          padding-left: 0;
+        }
+
+        .setup {
+          overflow: hidden;
+        }
+
+        .privacy-grid {
+          align-items: start;
+        }
+
+        .final {
+          text-align: left;
+        }
+
+        footer {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 14px;
+        }
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .hero-frame {
+          animation: arrive 700ms var(--ease) both;
+        }
+
+        @keyframes arrive {
+          from {
+            opacity: 0;
+            transform: translateY(18px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="shell">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="wordmark" href="#top" aria-label="Lasso home">
+          <span class="mark" aria-hidden="true">L</span>
+          Lasso
+        </a>
+        <div class="nav-links">
+          <a href="#how-it-works">How it works</a>
+          <a href="#library">History</a>
+          <a href="https://github.com/thomasfevre/lasso">GitHub ↗</a>
+          <a
+            class="button"
+            data-download
+            href="https://github.com/thomasfevre/lasso/releases/latest/download/Lasso-macos.zip"
+          >
+            Download for macOS
+          </a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero shell" id="top">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <span class="kicker">A precise instrument for your screen</span>
+            <h1>Point once. Your agent gets it.</h1>
+            <p>
+              Draw a rectangle around the exact visual state that matters. Add a pin
+              or a note, then let your coding agent inspect what you chose.
+            </p>
+            <div class="actions">
+              <a
+                class="button"
+                data-download
+                href="https://github.com/thomasfevre/lasso/releases/latest/download/Lasso-macos.zip"
+              >
+                Download for macOS
+              </a>
+              <a class="button secondary" href="https://github.com/thomasfevre/lasso">
+                View on GitHub ↗
+              </a>
+            </div>
+          </div>
+
+          <figure class="hero-visual">
+            <div class="hero-media">
+              <div class="hero-frame">
+                <img
+                  src="assets/screenshots/lasso-onboarding.png"
+                  width="1384"
+                  height="1544"
+                  fetchpriority="high"
+                  alt="Lasso onboarding showing the configurable keyboard shortcut and rectangular capture gesture."
+                />
+              </div>
+            </div>
+          </figure>
+        </div>
+      </section>
+
+      <section class="process" id="how-it-works">
+        <div class="shell">
+          <div class="process-head">
+            <h2>A three-step handoff, visible from end to end.</h2>
+            <p>
+              Lasso keeps the screenshot, your comments, and the surrounding context
+              together instead of scattering them across a prompt.
+            </p>
+          </div>
+
+          <ol class="steps">
+            <li>
+              <b>1</b>
+              <strong>Frame the problem</strong>
+              <span>Press your shortcut and drag one deliberate rectangle.</span>
+            </li>
+            <li>
+              <b>2</b>
+              <strong>Mark what matters</strong>
+              <span>Attach numbered pins or one note for the full capture.</span>
+            </li>
+            <li>
+              <b>3</b>
+              <strong>Let the agent inspect it</strong>
+              <span>Claude Code, Codex, and Cursor read the capture through MCP.</span>
+            </li>
+          </ol>
+
+          <figure class="annotation-stage">
+            <img
+              src="assets/screenshots/lasso-annotate.jpg"
+              width="1280"
+              height="1444"
+              loading="lazy"
+              alt="The Lasso annotation window with a rectangular capture, two numbered pins, pin comments, quick suggestions, and a capture note."
+            />
+          </figure>
+        </div>
+      </section>
+
+      <section class="library" id="library">
+        <div class="shell">
+          <div class="library-head">
+            <h2>Your context does not disappear after the handoff.</h2>
+            <p>
+              Browse captures by day, search notes and tags, keep the useful ones,
+              clean the rest, and export a focused set when a review needs to leave
+              your Mac.
+            </p>
+          </div>
+
+          <figure class="history-stage">
+            <img
+              src="assets/screenshots/lasso-history.jpg"
+              width="1800"
+              height="1193"
+              loading="lazy"
+              alt="Lasso Capture History showing a chronological grid, filters, tag selection, search, zoom, sharing, and export controls."
+            />
+            <figcaption class="history-caption">
+              <strong>A Photos-like library for visual work in progress.</strong>
+              <span>Search · Tags · Keep · Recently Deleted · Share · Export</span>
+            </figcaption>
+          </figure>
+
+          <div class="workflow" aria-label="Capture history workflow">
+            <div>
+              <strong>Collect without sorting first</strong>
+              <span>Every deliberate capture lands in a chronological local history.</span>
+            </div>
+            <div>
+              <strong>Group the work that belongs together</strong>
+              <span>Tags make a debugging session or design review easy to find again.</span>
+            </div>
+            <div>
+              <strong>Send the useful context</strong>
+              <span>Share or export selected captures with their annotations intact.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="setup shell">
+        <figure class="setup-visual">
+          <div class="shot">
+            <img
+              src="assets/screenshots/lasso-permissions.png"
+              width="1384"
+              height="1544"
+              alt="Lasso setup showing Screen Recording and Accessibility permissions granted."
+            />
+          </div>
+        </figure>
+
+        <div class="setup-copy">
+          <span class="feature-index">Setup</span>
+          <h2>A Mac utility, not another workspace.</h2>
+          <p>
+            Lasso lives in the menu bar. Grant Screen Recording, connect the bundled
+            MCP server to your agent, and use the shortcut whenever words are the slow
+            way to explain what is on screen.
+          </p>
+          <div class="clients" aria-label="Supported MCP clients">
+            <span>Claude Code</span>
+            <span>Codex</span>
+            <span>Cursor</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="privacy">
+        <div class="privacy-grid shell">
+          <h2>Your screen stays yours until you choose otherwise.</h2>
+          <div class="privacy-copy">
+            Lasso is a passive context provider. It never pushes a capture to an agent
+            on its own.
+            <div class="privacy-points">
+              <div>
+                <strong>Local storage</strong>
+                <span>Captures remain on your Mac and follow your retention setting.</span>
+              </div>
+              <div>
+                <strong>Explicit handoff</strong>
+                <span>Your agent reads a capture only when it asks through MCP.</span>
+              </div>
+              <div>
+                <strong>No account</strong>
+                <span>Install the app, connect your local client, and start capturing.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="final shell">
+        <h2>Give your agent the one thing it is missing.</h2>
+        <p>Lasso is free, open source, notarized, and built for macOS 14 or later.</p>
+        <a
+          class="button"
+          data-download
+          href="https://github.com/thomasfevre/lasso/releases/latest/download/Lasso-macos.zip"
+        >
+          Download for macOS
+        </a>
+      </section>
+    </main>
+
+    <footer class="shell">
+      <span>© 2026 Lasso</span>
+      <span>
+        <a href="https://github.com/thomasfevre/lasso">Source code</a>
+        ·
+        <a href="#top">Back to top ↑</a>
+      </span>
+    </footer>
+  </body>
+</html>
