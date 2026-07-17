@@ -8,6 +8,8 @@
       content="Lasso turns a deliberate rectangular screen capture into visual context your AI coding agent can inspect."
     />
     <meta name="theme-color" content="#f7f7f5" />
+    <link rel="icon" type="image/png" href="assets/lasso-icon.png" />
+    <link rel="apple-touch-icon" href="assets/lasso-icon.png" />
     <title>Lasso — Visual context for AI agents</title>
     <style>
       :root {
@@ -115,16 +117,10 @@
       }
 
       .mark {
-        align-items: center;
-        background: var(--amber);
-        border-radius: 5px;
-        color: var(--amber-ink);
-        display: inline-flex;
-        font-size: 14px;
-        font-weight: 900;
-        height: 24px;
-        justify-content: center;
-        width: 24px;
+        border-radius: 7px;
+        flex: 0 0 auto;
+        height: 28px;
+        width: 28px;
       }
 
       .nav-links {
@@ -726,7 +722,14 @@
     <header class="shell">
       <nav class="nav" aria-label="Main navigation">
         <a class="wordmark" href="#top" aria-label="Lasso home">
-          <span class="mark" aria-hidden="true">L</span>
+          <img
+            class="mark"
+            src="assets/lasso-icon.png"
+            width="28"
+            height="28"
+            alt=""
+            aria-hidden="true"
+          />
           Lasso
         </a>
         <div class="nav-links">
