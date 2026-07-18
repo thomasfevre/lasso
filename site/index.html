@@ -27,6 +27,13 @@
         --max: 1320px;
         --gutter: clamp(24px, 5vw, 72px);
         --ease: cubic-bezier(0.23, 1, 0.32, 1);
+        --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          "Helvetica Neue", Arial, sans-serif;
+        --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+          "Helvetica Neue", Arial, sans-serif;
+        --type-hero: clamp(52px, 5.4vw, 76px);
+        --type-section: clamp(40px, 4.2vw, 58px);
+        --type-section-compact: clamp(36px, 3.8vw, 52px);
       }
 
       * {
@@ -40,17 +47,17 @@
       body {
         background: var(--surface);
         color: var(--ink);
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
-          Arial, sans-serif;
+        font-family: var(--font-sans);
         font-size: 17px;
         line-height: 1.55;
         margin: 0;
         overflow-x: hidden;
       }
 
-      body,
       button,
-      a {
+      input,
+      select,
+      textarea {
         font: inherit;
       }
 
@@ -76,8 +83,7 @@
       h1,
       h2,
       h3 {
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
-          "Helvetica Neue", Arial, sans-serif;
+        font-family: var(--font-display);
         text-wrap: balance;
       }
 
@@ -111,7 +117,7 @@
         align-items: center;
         display: inline-flex;
         font-size: 17px;
-        font-weight: 750;
+        font-weight: 700;
         gap: 9px;
         letter-spacing: -0.025em;
       }
@@ -131,7 +137,7 @@
 
       .nav-links > a:not(.button) {
         color: var(--copy);
-        font-size: 16px;
+        font-size: 15px;
         font-weight: 600;
       }
 
@@ -143,8 +149,8 @@
         color: var(--surface);
         cursor: pointer;
         display: inline-flex;
-        font-size: 16px;
-        font-weight: 750;
+        font-size: 15px;
+        font-weight: 700;
         justify-content: center;
         min-height: 48px;
         padding: 13px 22px;
@@ -197,16 +203,16 @@
         color: var(--amber-deep);
         display: block;
         font-size: 16px;
-        font-weight: 660;
+        font-weight: 600;
         letter-spacing: -0.01em;
         margin-bottom: 22px;
       }
 
       h1 {
-        font-size: clamp(56px, 6vw, 82px);
-        font-weight: 690;
-        letter-spacing: -0.035em;
-        line-height: 0.99;
+        font-size: var(--type-hero);
+        font-weight: 700;
+        letter-spacing: -0.032em;
+        line-height: 1.01;
         margin-bottom: 28px;
         max-width: 600px;
       }
@@ -260,10 +266,10 @@
       }
 
       .process h2 {
-        font-size: clamp(44px, 4.8vw, 66px);
-        font-weight: 680;
-        letter-spacing: -0.035em;
-        line-height: 1.06;
+        font-size: var(--type-section);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.07;
         margin-bottom: 0;
       }
 
@@ -358,10 +364,10 @@
       }
 
       .library h2 {
-        font-size: clamp(44px, 5.3vw, 72px);
-        font-weight: 740;
-        letter-spacing: -0.035em;
-        line-height: 1.02;
+        font-size: var(--type-section);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.07;
         margin-bottom: 0;
         max-width: 850px;
       }
@@ -453,10 +459,10 @@
       }
 
       .setup h2 {
-        font-size: clamp(40px, 4.3vw, 58px);
-        font-weight: 740;
-        letter-spacing: -0.035em;
-        line-height: 1.04;
+        font-size: var(--type-section-compact);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.08;
         margin-bottom: 24px;
       }
 
@@ -494,10 +500,10 @@
       }
 
       .privacy h2 {
-        font-size: clamp(46px, 5.7vw, 76px);
-        font-weight: 750;
-        letter-spacing: -0.035em;
-        line-height: 1;
+        font-size: var(--type-section);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.07;
         margin: 0;
         max-width: 750px;
       }
@@ -537,10 +543,10 @@
       }
 
       .final h2 {
-        font-size: clamp(48px, 6vw, 80px);
-        font-weight: 760;
-        letter-spacing: -0.035em;
-        line-height: 1;
+        font-size: var(--type-section);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.07;
         margin: 0 auto 27px;
         max-width: 880px;
       }
@@ -628,7 +634,7 @@
         }
 
         h1 {
-          font-size: clamp(48px, 13.5vw, 60px);
+          font-size: clamp(46px, 13vw, 58px);
         }
 
         .shot,
