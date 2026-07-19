@@ -110,7 +110,7 @@ public enum SecretRedactor {
         let found = pattern.regex.matches(in: text, range: full)
         guard !found.isEmpty else { return text }
         // Replace from the end so earlier ranges stay valid.
-        var out = ns.mutableCopy() as! NSMutableString
+        let out = ns.mutableCopy() as! NSMutableString
         for m in found.reversed() {
             matches.append(Match(kind: pattern.kind, value: ns.substring(with: m.range)))
             out.replaceCharacters(in: m.range, with: placeholder)

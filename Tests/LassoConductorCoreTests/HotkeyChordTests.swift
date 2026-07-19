@@ -2,8 +2,8 @@ import XCTest
 @testable import LassoConductorCore
 
 final class HotkeyChordTests: XCTestCase {
-    func testDefaultChordIsOptionSpace() {
-        XCTAssertEqual(HotkeyChord.defaultCapture.description, "⌥Space")
+    func testDefaultChordIsControlOptionSpace() {
+        XCTAssertEqual(HotkeyChord.defaultCapture.description, "⌃⌥Space")
         XCTAssertNil(HotkeyChord.defaultCapture.validationError)
     }
 
@@ -67,6 +67,12 @@ final class HotkeyChordTests: XCTestCase {
         let chord = HotkeyChord(keyCode: 49, modifiers: [.command])
 
         XCTAssertEqual(chord.validationError, .systemReserved("⌘Space"))
+    }
+
+    func testOptionSpaceIsRejectedBecauseFinderUsesQuickLook() {
+        let chord = HotkeyChord(keyCode: 49, modifiers: [.option])
+
+        XCTAssertEqual(chord.validationError, .systemReserved("⌥Space"))
     }
 
     func testOrdinaryModifiedKeyIsValid() {

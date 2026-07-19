@@ -19,13 +19,15 @@ to a Lasso-operated server.
 
 ## Local storage and retention
 
-Captures are stored in `~/Library/Application Support/Lasso/` as a local SQLite
-database and PNG files. Recent captures are kept for seven days by default and
-are capped at the newest 100. You can change the duration to 1 hour, 1 day,
-7 days, 30 days, or 90 days in Settings. Captures marked Keep are excluded from
-automatic retention. Manually deleted captures remain restorable in Recently
-Deleted for the same selected duration. The store directory is owner-only and
-capture files are created with owner-only permissions.
+By default, captures are stored in `~/Library/Application Support/Lasso/` as a
+local SQLite database and PNG files. You can move the library to another folder
+from Settings. Settings always displays the folder currently in use. Recent
+captures are kept for seven days by default and are capped at the newest 100.
+You can change the duration to 1 hour, 1 day, 7 days, 30 days, or 90 days in
+Settings. Captures marked Keep are excluded from automatic retention. Manually
+deleted captures remain restorable in Recently Deleted for the same selected
+duration. The store directory is owner-only and capture files are created with
+owner-only permissions.
 
 An MCP client reads this local store only when it invokes a Lasso tool. The
 client may then transmit the returned capture to its own configured service;
@@ -42,10 +44,14 @@ your selected coding agent.
 ## Delete local data
 
 Use History to remove individual captures, or Settings to clear all Recent
-captures after confirmation. Quit Lasso, then delete
-`~/Library/Application Support/Lasso/` to remove the complete local library and
-browser-pairing state. You can also revoke active browser pairings from Lasso's
-menu before deleting the folder.
+captures after confirmation. To remove the complete local library, note the
+current Storage path in Settings, quit Lasso, then delete that folder. The
+default path is `~/Library/Application Support/Lasso/`.
+
+Browser pairing credentials are separate from the capture library. Lasso keeps
+its side in the macOS Keychain and Chrome keeps its side in extension storage.
+Use Revoke all browser pairings from Lasso's menu, then remove the extension
+from Chrome if you want to remove that integration completely.
 
 To remove the optional Chrome integration, remove the unpacked Lasso extension
 from `chrome://extensions`. The Native Messaging manifest is located at

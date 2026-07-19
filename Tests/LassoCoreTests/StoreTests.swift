@@ -149,6 +149,7 @@ final class StoreTests: XCTestCase {
         }
         XCTAssertEqual(try permissions(dir), 0o700)
         XCTAssertEqual(try permissions(dir.appendingPathComponent("store.sqlite3")), 0o600)
+        XCTAssertEqual(try permissions(dir.appendingPathComponent(".capture-lifecycle.lock")), 0o600)
         XCTAssertEqual(try permissions(dir.appendingPathComponent(capture.imageFile)), 0o600)
         for suffix in ["-wal", "-shm"] {
             let url = dir.appendingPathComponent("store.sqlite3" + suffix)
@@ -214,6 +215,62 @@ final class StoreTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: actual)
 
         XCTAssertThrowsError(try Store(directory: link))
+    }
+
+    func testMovingLibraryKeepsDatabaseAndImagesTogether() throws {
+        let store = try makeStore()
+        let capture = try store.insert(imagePNG: png, context: CaptureContext(), note: "move me")
+        let parent = dir.deletingLastPathComponent().appendingPathComponent("lasso-parent-" + UUID().uuidString,
+                                                                              isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let destination = StoreLocationMigration.libraryDirectory(in: parent)
+
+        try StoreLocationMigration.moveLibrary(from: dir, to: destination)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.path))
+        let moved = try Store(directory: destination, access: .reader)
+        XCTAssertEqual(try moved.latest()?.note, "move me")
+        XCTAssertEqual(try moved.imageData(for: capture), png)
+    }
+
+    func testMovingLibraryRejectsAUsedDestination() throws {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let parent = dir.deletingLastPathComponent().appendingPathComponent("lasso-parent-" + UUID().uuidString,
+                                                                              isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let destination = StoreLocationMigration.libraryDirectory(in: parent)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("existing".utf8).write(to: destination.appendingPathComponent("unrelated.txt"))
+
+        XCTAssertThrowsError(try StoreLocationMigration.moveLibrary(from: dir, to: destination)) { error in
+            XCTAssertEqual(error as? StoreLocationMigration.Error, .destinationAlreadyContainsFiles)
+        }
+    }
+
+    func testConfiguredLibraryLocationIsUsedUnlessEnvironmentOverridesIt() {
+        let configured = URL(fileURLWithPath: "/tmp/lasso-configured", isDirectory: true)
+        let overridden = URL(fileURLWithPath: "/tmp/lasso-environment", isDirectory: true)
+
+        XCTAssertEqual(
+            Store.defaultDirectory(environment: [:], configuredDirectory: configured),
+            configured
+        )
+        XCTAssertEqual(
+            Store.defaultDirectory(
+                environment: ["LASSO_STORE_DIR": overridden.path],
+                configuredDirectory: configured
+            ),
+            overridden
+        )
+    }
+
+    func testMovingLibraryRejectsDestinationInsideItsSource() throws {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let destination = dir.appendingPathComponent("nested/Lasso", isDirectory: true)
+
+        XCTAssertThrowsError(try StoreLocationMigration.moveLibrary(from: dir, to: destination)) { error in
+            XCTAssertEqual(error as? StoreLocationMigration.Error, .destinationInsideSource)
+        }
     }
 
     private func execute(storePath: String, sql: String) throws {

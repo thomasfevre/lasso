@@ -90,7 +90,11 @@ enum Glass {
     }
 
     /// Hairline that separates glass from the ground without a hard outline.
-    static func hairline(dark: Bool) -> NSColor { NSColor.white.withAlphaComponent(0.09) }
+    static func hairline(dark: Bool) -> NSColor {
+        NSColor.white.withAlphaComponent(
+            NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 0.24 : 0.09
+        )
+    }
 }
 
 /// A directional specular rim — the single biggest difference between cheap and
@@ -149,12 +153,32 @@ final class GlassRim {
 /// Opaque (no desktop show-through) — the warm-glass look depends on a controlled
 /// dark field, not the user's wallpaper.
 final class GlassBackdrop: NSView {
+    private var displayOptionsObserver: NSObjectProtocol?
+
     override var isOpaque: Bool { true }
     override var allowsVibrancy: Bool { false }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in self?.needsDisplay = true }
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    deinit {
+        if let displayOptionsObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(displayOptionsObserver)
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         Glass.ground.setFill()
         bounds.fill()
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency else { return }
         drawGlow(center: CGPoint(x: bounds.maxX - bounds.width * 0.18, y: bounds.maxY - bounds.height * 0.06),
                  radius: bounds.width * 0.9,
                  color: NSColor(srgbRed: 0.47, green: 0.34, blue: 0.17, alpha: 1), peak: 0.30)
@@ -177,6 +201,7 @@ final class GlassCard: NSView {
     private let surface = NSView()
     private let rim = GlassRim(radius: Glass.Radius.md)
     private let sheen = CAGradientLayer()   // faint diagonal light across the glass
+    private var displayOptionsObserver: NSObjectProtocol?
 
     init() {
         super.init(frame: .zero)
@@ -204,8 +229,19 @@ final class GlassCard: NSView {
         surface.layer?.addSublayer(sheen)
         surface.layer?.addSublayer(rim.gradient)
         restyle()
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in self?.restyle() }
     }
     required init?(coder: NSCoder) { fatalError("unused") }
+
+    deinit {
+        if let displayOptionsObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(displayOptionsObserver)
+        }
+    }
 
     /// Content is added here so it sits inside the rounded, clipped surface.
     var contentView: NSView { surface }
@@ -222,13 +258,21 @@ final class GlassCard: NSView {
     private func restyle() {
         // A warm smoked-glass panel over the dark ground: a translucent warm fill,
         // a directional specular rim, and a faint diagonal sheen — no flat border.
-        surface.layer?.backgroundColor = NSColor(srgbRed: 0.118, green: 0.102, blue: 0.082, alpha: 0.55).cgColor
+        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        surface.layer?.backgroundColor = NSColor(
+            srgbRed: 0.118,
+            green: 0.102,
+            blue: 0.082,
+            alpha: reduceTransparency ? 0.98 : (increaseContrast ? 0.72 : 0.55)
+        ).cgColor
         sheen.colors = [
-            NSColor.white.withAlphaComponent(0.07).cgColor,
+            NSColor.white.withAlphaComponent(reduceTransparency ? 0 : (increaseContrast ? 0.11 : 0.07)).cgColor,
             NSColor.white.withAlphaComponent(0).cgColor,
         ]
-        rim.setColors(dark: true)
-        layer?.shadowOpacity = 0.5
+        rim.setColors(dark: true, focused: increaseContrast)
+        layer?.shadowOpacity = reduceTransparency ? 0 : 0.5
+        needsDisplay = true
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -241,7 +285,8 @@ final class GlassCard: NSView {
 /// states drawn to match the glass system. Primary = accent-filled with a rim +
 /// glow; secondary = translucent glass; plain = text/icon.
 final class LassoButton: NSButton {
-    enum Kind { case primary, secondary, plain }
+    enum Kind { case primary, secondary, destructive, plain }
+    private static let iconButtonDiameter: CGFloat = 36
 
     private let kind: Kind
     private let onClick: () -> Void
@@ -255,15 +300,12 @@ final class LassoButton: NSButton {
         self.onClick = onClick
         self.isIconOnly = title.isEmpty && symbolName != nil
         super.init(frame: .zero)
+        // This button is always positioned by a parent stack or explicit
+        // constraints. Leaving the autoresizing mask on lets AppKit translate
+        // its initial frame into a competing height constraint.
+        translatesAutoresizingMaskIntoConstraints = false
         self.title = title
-        if let symbolName {
-            image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityLabel)?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
-            imagePosition = title.isEmpty ? .imageOnly : .imageLeading
-            imageScaling = .scaleProportionallyDown
-            setAccessibilityLabel(accessibilityLabel ?? title)
-            toolTip = accessibilityLabel
-        }
+        if let symbolName { setSymbol(symbolName, accessibilityLabel: accessibilityLabel ?? title) }
         isBordered = false
         bezelStyle = .regularSquare
         wantsLayer = true
@@ -275,6 +317,11 @@ final class LassoButton: NSButton {
         if isIconOnly {
             setContentHuggingPriority(.required, for: .horizontal)
             setContentCompressionResistancePriority(.required, for: .horizontal)
+            // NSStackView can stretch a view when only its aspect ratio is
+            // constrained. Pin both dimensions so history navigation remains a
+            // 36 × 36 pt circle under every header height.
+            widthAnchor.constraint(equalToConstant: Self.iconButtonDiameter).isActive = true
+            heightAnchor.constraint(equalToConstant: Self.iconButtonDiameter).isActive = true
         }
         if kind == .primary {
             layer?.masksToBounds = false
@@ -290,14 +337,54 @@ final class LassoButton: NSButton {
     /// the amber fill.
     var selected = false { didSet { needsDisplay = true } }
 
+    override var isEnabled: Bool {
+        didSet {
+            alphaValue = isEnabled ? 1 : 0.45
+            needsDisplay = true
+        }
+    }
+
+    func setSymbol(_ symbolName: String, accessibilityLabel: String) {
+        image = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityLabel)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+        imagePosition = isIconOnly ? .imageOnly : .imageLeading
+        // Keep a symbol and its label as one centered content group. The
+        // default cell layout can otherwise pin the image left while
+        // independently centering the title inside a custom-drawn pill.
+        imageHugsTitle = !isIconOnly
+        imageScaling = .scaleProportionallyDown
+        setAccessibilityLabel(accessibilityLabel)
+        toolTip = accessibilityLabel
+        needsDisplay = true
+    }
+
+    /// AppKit gives standard buttons extra visual margins outside their alignment
+    /// rect. That is useful for text controls, but it turns a constrained 36 pt
+    /// icon button into a 36.5 × 41 pt drawing surface. Icon-only controls own
+    /// their circular silhouette, so their alignment and drawing rects must be
+    /// identical.
+    override var alignmentRectInsets: NSEdgeInsets {
+        isIconOnly ? NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0) : super.alignmentRectInsets
+    }
+
     override var intrinsicContentSize: NSSize {
         if isIconOnly {
-            return NSSize(width: 36, height: 36)
+            return NSSize(width: Self.iconButtonDiameter, height: Self.iconButtonDiameter)
         }
         var s = super.intrinsicContentSize
         s.height = 32
         s.width += Glass.Space.lg
         return s
+    }
+
+    override func layout() {
+        super.layout()
+        // AppKit can reuse an icon button while its enclosing stack changes
+        // size. Keeping the layer geometry in sync prevents a square-looking
+        // hit/background during those transitions; the custom path still draws
+        // the soft continuous edge and the unmasked layer preserves shadows.
+        layer?.cornerRadius = bounds.height / 2
+        layer?.cornerCurve = .continuous
     }
 
     override func updateTrackingAreas() {
@@ -310,9 +397,13 @@ final class LassoButton: NSButton {
     override func mouseEntered(with event: NSEvent) { hovering = true; needsDisplay = true }
     override func mouseExited(with event: NSEvent) { hovering = false; needsDisplay = true }
     override func mouseDown(with event: NSEvent) {
-        pressed = true; needsDisplay = true
+        pressed = true
+        updatePressedPresentation()
+        needsDisplay = true
         super.mouseDown(with: event)
-        pressed = false; needsDisplay = true
+        pressed = false
+        updatePressedPresentation()
+        needsDisplay = true
     }
     @objc private func fire() { onClick() }
 
@@ -320,13 +411,33 @@ final class LassoButton: NSButton {
         switch kind {
         case .primary: return Glass.amberInk       // dark ink on the amber pill
         case .secondary: return selected ? Glass.amberInk : Glass.ink
+        case .destructive: return .systemRed
         case .plain: return Glass.muted
         }
     }
 
+    /// A tiny physical press acknowledgement is enough for a desktop button.
+    /// It starts at mouse-down, remains interruptible by AppKit's normal mouse
+    /// tracking, and respects the system Reduce Motion setting.
+    private func updatePressedPresentation() {
+        guard let layer else { return }
+        let transform = pressed && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? CATransform3DMakeScale(0.97, 0.97, 1)
+            : CATransform3DIdentity
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(pressed ? 0.08 : 0.14)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        layer.transform = transform
+        CATransaction.commit()
+    }
+
     override func draw(_ dirtyRect: NSRect) {
+        // The radius is clamped to half of the shortest edge. This matters for
+        // the circular history-navigation controls as well as text pills when
+        // Auto Layout is resolving a transient frame.
+        let radius = min(bounds.width, bounds.height) / 2
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+                                xRadius: radius, yRadius: radius)
         switch kind {
         case .primary:
             // The warm amber pill: a diagonal amber gradient with a bright top rim.
@@ -346,6 +457,14 @@ final class LassoButton: NSButton {
                 path.fill()
                 Glass.hairline(dark: true).setStroke()
             }
+            path.lineWidth = 1
+            path.stroke()
+        case .destructive:
+            NSColor.systemRed.withAlphaComponent(
+                hovering ? (pressed ? 0.18 : 0.13) : 0.06
+            ).setFill()
+            path.fill()
+            NSColor.systemRed.withAlphaComponent(hovering ? 0.65 : 0.38).setStroke()
             path.lineWidth = 1
             path.stroke()
         case .plain:

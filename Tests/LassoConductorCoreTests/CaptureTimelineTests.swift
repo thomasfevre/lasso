@@ -58,6 +58,46 @@ final class CaptureHistoryOpeningTests: XCTestCase {
     }
 }
 
+final class CaptureHistoryLoadingTests: XCTestCase {
+    private enum FixtureError: Error { case missingImage }
+
+    func testUnavailableImageDoesNotDiscardOtherCaptures() {
+        let available = Capture(id: 1, createdAt: .distantPast,
+                                imageFile: "available.png", note: nil,
+                                context: CaptureContext())
+        let unavailable = Capture(id: 2, createdAt: .distantPast,
+                                  imageFile: "missing.png", note: nil,
+                                  context: CaptureContext())
+
+        let loaded = CaptureHistoryLoading.loadable([available, unavailable]) { capture in
+            guard capture.id == available.id else { throw FixtureError.missingImage }
+            return "decoded image"
+        }
+
+        XCTAssertEqual(loaded.map { $0.0.id }, [available.id])
+        XCTAssertEqual(loaded.map { $0.1 }, ["decoded image"])
+    }
+
+    func testResolvedLoadingKeepsUnavailableCapturesManageable() {
+        let available = Capture(id: 1, createdAt: .distantPast,
+                                imageFile: "available.png", note: nil,
+                                context: CaptureContext())
+        let unavailable = Capture(id: 2, createdAt: .distantPast,
+                                  imageFile: "missing.png", note: nil,
+                                  context: CaptureContext())
+
+        let resolved = CaptureHistoryLoading.resolved([available, unavailable]) { capture in
+            guard capture.id == available.id else { throw FixtureError.missingImage }
+            return "decoded image"
+        }
+
+        XCTAssertEqual(resolved.map { $0.capture.id }, [available.id, unavailable.id])
+        XCTAssertEqual(resolved[0].value, "decoded image")
+        XCTAssertNil(resolved[1].value)
+        XCTAssertEqual(resolved.filter { $0.value == nil }.count, 1)
+    }
+}
+
 final class CaptureDetailIndexTests: XCTestCase {
     func testSelectedCaptureCanAppearTwiceWithoutTrapping() {
         let active = Capture(id: 7, createdAt: .distantPast, imageFile: "7.png", note: "active", context: CaptureContext())

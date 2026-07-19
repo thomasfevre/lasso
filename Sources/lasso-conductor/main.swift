@@ -9,6 +9,13 @@ import AppKit
 
 let app = NSApplication.shared
 #if DEBUG
+if let screen = ProcessInfo.processInfo.environment[OnboardingSmokeApp.environmentKey] {
+    let smoke = OnboardingSmokeApp(screen: screen)
+    app.delegate = smoke
+    app.setActivationPolicy(.regular)
+    app.run()
+    exit(0)
+}
 if ProcessInfo.processInfo.environment[CaptureHistorySmokeApp.environmentKey] == "1" {
     let smoke = CaptureHistorySmokeApp()
     app.delegate = smoke
@@ -18,6 +25,13 @@ if ProcessInfo.processInfo.environment[CaptureHistorySmokeApp.environmentKey] ==
 }
 if ProcessInfo.processInfo.environment[LibrarySettingsSmokeApp.environmentKey] == "1" {
     let smoke = LibrarySettingsSmokeApp()
+    app.delegate = smoke
+    app.setActivationPolicy(.regular)
+    app.run()
+    exit(0)
+}
+if ProcessInfo.processInfo.environment[ShortcutSettingsSmokeApp.environmentKey] == "1" {
+    let smoke = ShortcutSettingsSmokeApp()
     app.delegate = smoke
     app.setActivationPolicy(.regular)
     app.run()

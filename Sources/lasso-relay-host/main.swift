@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import LassoCore
 
 // Kept intentionally larger than RelayServer's 64 KiB UDS cap: this matches
 // Chrome's own native-messaging outgoing-message limit (1 MiB). Oversized frames
@@ -93,11 +94,10 @@ if CommandLine.arguments.count > 1 {
     log("invoked by \(CommandLine.arguments[1])")
 }
 
-// Chrome does not inherit the Conductor's development environment, so the
-// native host intentionally does not support LASSO_STORE_DIR overrides.
-let home = ProcessInfo.processInfo.environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
-let socketPath = URL(fileURLWithPath: home, isDirectory: true)
-    .appendingPathComponent("Library/Application Support/Lasso/relay.sock").path
+// Resolve the same user-selected library as the Conductor. Chrome normally
+// does not inherit a development LASSO_STORE_DIR override, but both processes
+// can read the shared persisted preference.
+let socketPath = Store.defaultDirectory().appendingPathComponent("relay.sock").path
 
 guard let socketFD = connectToConductor(path: socketPath) else {
     log("could not connect to \(socketPath): \(String(cString: strerror(errno)))")

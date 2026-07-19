@@ -42,8 +42,8 @@ A dedicated library window for browsing Captures as a chronological visual grid.
 It supports continuously changing the thumbnail density and filters for All,
 Recents, Kept, and Recently Deleted. Thumbnails show a discreet pin count;
 full annotations appear only in the detail view. The detail view has a
-collapsible Context section for capture metadata. Search covers Tags, capture
-notes, pin notes, application names, and window or page titles.
+collapsible Context section for capture metadata. Search covers OCR/DOM text,
+Tags, capture notes, pin notes, application names, and window or page titles.
 _Avoid_: menu popover, screenshot folder
 
 **Capture package**:

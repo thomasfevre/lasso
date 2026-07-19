@@ -19,8 +19,8 @@ struct AnnotationResult {
 }
 
 enum AnnotationPrompt {
-    static func run(image: NSImage?) -> AnnotationResult {
-        AnnotationController().run(image: image)
+    static func run(image: NSImage?, onPresented: (() -> Void)? = nil) -> AnnotationResult {
+        AnnotationController().run(image: image, onPresented: onPresented)
     }
 }
 
@@ -51,12 +51,24 @@ private final class AnnotationController: NSObject, NSWindowDelegate {
 
     private let contentWidth: CGFloat = 480
 
-    func run(image: NSImage?) -> AnnotationResult {
+    func run(image: NSImage?, onPresented: (() -> Void)? = nil) -> AnnotationResult {
         build(image: image)
         NSApp.activate(ignoringOtherApps: true)
         window.center()
+        // The panel starts responding on its first visible frame. A short fade
+        // makes the material arrive without delaying annotation; Reduce Motion
+        // keeps the same state change but skips the transition.
+        window.alphaValue = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 1 : 0
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(canvas)
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                window.animator().alphaValue = 1
+            }
+        }
+        onPresented?()
         NSApp.runModal(for: window)
         window.orderOut(nil)
         return saved ? result : .empty

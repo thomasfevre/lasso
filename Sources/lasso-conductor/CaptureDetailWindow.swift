@@ -19,10 +19,13 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
     private var olderButton: LassoButton?
     private var keepButton: LassoButton?
     private var trashButton: LassoButton?
+    private var copyButton: LassoButton?
 
     private var capturesByID: [Int64: Capture] = [:]
     private var timeline = CaptureTimeline(idsNewestFirst: [])
     private var currentID: Int64?
+    private var currentCapture: Capture?
+    private var currentImage: NSImage?
     private var contextExpanded = false
 
     func showLatest() {
@@ -57,14 +60,21 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
         }
     }
 
+    /// A new capture is a separate task from reviewing a saved Capture. Keep the
+    /// existing detail state in memory, but take its window out of the ordering
+    /// so it cannot come back to the front after the capture overlay closes.
+    func dismissForNewCapture() {
+        window?.orderOut(nil)
+    }
+
     private func show(captureID: Int64, store: Store) throws {
         guard let capture = capturesByID[captureID] else { return }
-        guard let image = NSImage(data: try store.imageData(for: capture)) else {
-            throw StoreError.imageRead("could not decode capture image")
-        }
+        let image = (try? store.imageData(for: capture)).flatMap(NSImage.init(data:))
+        let imageAvailable = image != nil
+        let displayImage = image ?? CaptureImagePlaceholder.make()
         if window == nil { buildWindow() }
         currentID = captureID
-        render(capture, image: image)
+        render(capture, image: displayImage, imageAvailable: imageAvailable)
         NSApp.activate(ignoringOtherApps: true)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -102,16 +112,29 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
                                 kind: .secondary) { [weak self] in self?.navigateNewer() }
         let older = LassoButton("", symbolName: "chevron.right", accessibilityLabel: "Older capture",
                                 kind: .secondary) { [weak self] in self?.navigateOlder() }
+        let copy = LassoButton("Copy", symbolName: "doc.on.doc", accessibilityLabel: "Copy capture with comments and context",
+                               kind: .secondary) { [weak self] in self?.copyCapture() }
         let keep = LassoButton("Keep", kind: .secondary) { [weak self] in self?.toggleKeep() }
         keepButton = keep
-        let trash = LassoButton("Move to Recently Deleted", kind: .plain) { [weak self] in self?.moveToTrash() }
+        copyButton = copy
+        let trash = LassoButton(
+            "",
+            symbolName: "trash",
+            accessibilityLabel: "Move to Recently Deleted",
+            kind: .destructive
+        ) { [weak self] in self?.moveToTrash() }
         trashButton = trash
         newerButton = newer
         olderButton = older
         let close = LassoButton("", symbolName: "xmark", accessibilityLabel: "Close",
                                kind: .plain) { [weak self] in self?.window?.close() }
         let headerSpacer = flexibleSpacer()
-        let header = stack([titleStack, headerSpacer, newer, older, keep, trash, close], orientation: .horizontal, spacing: Glass.Space.sm)
+        let navigation = stack([newer, older], orientation: .horizontal, spacing: Glass.Space.xs)
+        navigation.alignment = .centerY
+        let libraryActions = stack([keep, trash], orientation: .horizontal, spacing: Glass.Space.sm)
+        libraryActions.alignment = .centerY
+        let header = stack([titleStack, headerSpacer, navigation, copy, libraryActions, close],
+                           orientation: .horizontal, spacing: Glass.Space.md)
         header.alignment = .centerY
 
         let preview = CapturePreviewCanvas()
@@ -139,7 +162,7 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
         let tagsHeader = label("TAGS", font: .systemFont(ofSize: 10, weight: .semibold), color: Glass.faint)
         let tags = wrappingLabel("")
         tagsLabel = tags
-        let editTags = LassoButton("Edit tags…", kind: .plain) { [weak self] in self?.editTags() }
+        let editTags = LassoButton("Edit tags", kind: .plain) { [weak self] in self?.editTags() }
         let tagsRow = stack([tags, editTags], orientation: .horizontal, spacing: Glass.Space.sm)
         tagsRow.alignment = .centerY
         let pinsHeader = label("PINS", font: .systemFont(ofSize: 10, weight: .semibold), color: Glass.faint)
@@ -197,10 +220,14 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
 
     // MARK: - Rendering
 
-    private func render(_ capture: Capture, image: NSImage) {
+    private func render(_ capture: Capture, image: NSImage, imageAvailable: Bool) {
         titleLabel?.stringValue = "Capture \(capture.id)"
-        subtitleLabel?.stringValue = subtitle(for: capture)
+        let availability = imageAvailable ? "" : " · Image unavailable"
+        subtitleLabel?.stringValue = subtitle(for: capture) + availability
         window?.title = "Capture \(capture.id)"
+        currentCapture = capture
+        currentImage = imageAvailable ? image : nil
+        copyButton?.isEnabled = imageAvailable
         canvas?.image = image
         canvas?.markers = capture.markers
         noteLabel?.stringValue = capture.note?.isEmpty == false ? capture.note! : "No note on this capture."
@@ -220,7 +247,31 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
         keepButton?.title = capture.libraryState == .kept ? "Unkeep" : "Keep"
         keepButton?.selected = capture.libraryState == .kept
         keepButton?.isHidden = capture.libraryState == .recentlyDeleted
-        trashButton?.title = capture.libraryState == .recentlyDeleted ? "Restore / Erase…" : "Move to Recently Deleted"
+        if capture.libraryState == .recentlyDeleted {
+            trashButton?.setSymbol(
+                "trash.slash",
+                accessibilityLabel: "Restore or permanently delete this capture"
+            )
+        } else {
+            trashButton?.setSymbol(
+                "trash",
+                accessibilityLabel: "Move to Recently Deleted"
+            )
+        }
+    }
+
+    /// Copies the annotated screenshot and the complete structured Capture as
+    /// one pasteboard item, preserving the visual reference and its meaning.
+    private func copyCapture() {
+        guard let currentCapture, let currentImage,
+              CaptureClipboard.write(capture: currentCapture, image: currentImage, to: .general) else {
+            NSSound.beep()
+            return
+        }
+        copyButton?.title = "Copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.copyButton?.title = "Copy"
+        }
     }
 
     private func renderPins(_ markers: [Marker]) {
@@ -312,7 +363,13 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
                 else if result == .alertSecondButtonReturn { try store.permanentlyErase(id: currentID) }
                 else { return }
                 window?.close()
-            } catch { showError(error) }
+            } catch {
+                do {
+                    let reader = try Store(directory: Store.defaultDirectory(), access: .reader)
+                    if try reader.capture(id: currentID) == nil { window?.close() }
+                } catch { /* preserve the current window if authoritative state is unavailable */ }
+                showError(error)
+            }
             return
         }
         let alert = NSAlert()
@@ -361,11 +418,8 @@ final class CaptureDetailController: NSObject, NSWindowDelegate {
     // MARK: - Small UI helpers
 
     private func subtitle(for capture: Capture) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
         let pinText = capture.markers.count == 1 ? "1 pin" : "\(capture.markers.count) pins"
-        return "\(formatter.string(from: capture.createdAt)) · \(pinText)"
+        return "\(CaptureDisplayDate.detail(capture.createdAt)) · \(pinText)"
     }
 
     private func label(_ string: String, font: NSFont, color: NSColor) -> NSTextField {
@@ -443,7 +497,14 @@ private final class CapturePreviewCanvas: NSView {
         bounds.fill()
         guard let image else { return }
         let imageRect = aspectFit(image.size, in: bounds.insetBy(dx: 2, dy: 2))
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(
+            roundedRect: imageRect,
+            xRadius: Glass.Radius.sm - 4,
+            yRadius: Glass.Radius.sm - 4
+        ).addClip()
         image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
         for marker in markers.sorted(by: { $0.index < $1.index }) {
             let center = PinBadgeRenderer.center(for: marker, in: imageRect)
             PinBadgeRenderer.draw(

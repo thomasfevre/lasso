@@ -42,7 +42,7 @@ public enum RegistrationSnippet {
         case .claude:
             let cliPath = shellQuoted(binaryPath)
             return """
-            Claude Code — run:
+            Claude Code: run this command:
                 claude mcp add lasso \(cliPath)
 
             or add to your MCP config JSON:
@@ -54,7 +54,7 @@ public enum RegistrationSnippet {
             """
         case .cursor:
             return """
-            Cursor — add to ~/.cursor/mcp.json:
+            Cursor: add this to ~/.cursor/mcp.json:
                 {
                   "mcpServers": {
                     "lasso": { "command": "\(path)" }
@@ -63,7 +63,7 @@ public enum RegistrationSnippet {
             """
         case .codex:
             return """
-            Codex — add to ~/.codex/config.toml:
+            Codex: add this to ~/.codex/config.toml:
                 [mcp_servers.lasso]
                 command = "\(path)"
 

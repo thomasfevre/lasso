@@ -31,13 +31,13 @@ let package = Package(
         .systemLibrary(name: "CSQLite", path: "Sources/CSQLite"),
         .target(name: "LassoCore", dependencies: ["CSQLite"]),
         .target(name: "LassoHub", dependencies: ["LassoCore"]),
-        // Cross-platform, AppKit-free pure logic for the Conductor: window routing
-        // (SPE-547) and later the Relay auth/pairing state machine and coordinate
-        // translation. Kept a plain library so its seams unit-test on any platform.
+        // Shared, testable Conductor logic. Platform-neutral routing, relay, and
+        // lifecycle seams build everywhere; macOS rendering helpers are guarded
+        // with `#if os(macOS)` so the package still builds on other platforms.
         .target(name: "LassoConductorCore", dependencies: ["LassoCore"]),
         .executableTarget(name: "lasso-mcp", dependencies: ["LassoHub"]),
         .executableTarget(name: "lasso-seed", dependencies: ["LassoCore"]),
-        .executableTarget(name: "lasso-relay-host", dependencies: []),
+        .executableTarget(name: "lasso-relay-host", dependencies: ["LassoCore"]),
         .executableTarget(name: "lasso-conductor",
                           dependencies: ["LassoCore", "LassoConductorCore", "LassoHub"],
                           linkerSettings: [.linkedFramework("Security", .when(platforms: [.macOS]))]),

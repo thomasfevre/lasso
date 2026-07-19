@@ -46,6 +46,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     /// pills switch it in place rather than dumping every client's config at once.
     private var registerClient: RegistrationClient = .claude
     private weak var registerTextView: NSTextView?
+    private weak var registerCopyButton: LassoButton?
+    private var copyFeedbackWorkItem: DispatchWorkItem?
+    private var currentBody: NSView?
     private var renderedScreen: Screen?
     /// The screen on display. Usually tracks the natural progression, but the
     /// user can move it backward with "Back"; auto-advance only fires on a fresh
@@ -55,30 +58,50 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     private var lastPaired = false
     private weak var doneInstructionsLabel: NSTextField?
     private weak var demoView: GestureDemoView?
+    private weak var hotkeySettings: HotkeySettingsRow?
     private let activeHotkey: () -> HotkeyChord
     private let updateHotkey: (HotkeyChord) -> Bool
+    private let hotkeyEditingChanged: (Bool) -> Void
 
     private let width: CGFloat = 580
     private let height: CGFloat = 660
 
     init(relay: RelayServer?,
          activeHotkey: @escaping () -> HotkeyChord,
-         updateHotkey: @escaping (HotkeyChord) -> Bool) {
+         updateHotkey: @escaping (HotkeyChord) -> Bool,
+         hotkeyEditingChanged: @escaping (Bool) -> Void = { _ in }) {
         self.relay = relay
         self.activeHotkey = activeHotkey
         self.updateHotkey = updateHotkey
+        self.hotkeyEditingChanged = hotkeyEditingChanged
         super.init()
     }
 
     func show() {
+        present(startingAt: state().isComplete ? .done : .welcome)
+    }
+
+    /// Settings and History can reopen the extension step directly. The
+    /// extension stays optional, but this gives it a discoverable home after
+    /// onboarding rather than forcing users to restart the whole guide.
+    func showExtensionSetup() {
+        extensionSkipped = false
+        present(startingAt: .extensionPairing)
+    }
+
+    /// Storage relocation restarts the browser relay. Keep an already-created
+    /// setup window observing the replacement instead of the stopped server.
+    func updateRelay(_ relay: RelayServer?) {
+        self.relay = relay
+    }
+
+    private func present(startingAt screen: Screen) {
         if window == nil { build() }
         NSApp.activate(ignoringOtherApps: true)
         window.center()
         window.makeKeyAndOrderFront(nil)
         let s = state()
-        // A returning user who already finished lands on the recap; everyone else
-        // starts at the welcome hook.
-        displayedScreen = s.isComplete ? .done : .welcome
+        displayedScreen = screen
         lastScreenRecording = s.screenRecordingGranted
         lastPaired = s.extensionPaired
         renderedScreen = nil
@@ -195,13 +218,19 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         renderedScreen = screen
         demoView?.stop()
         demoView = nil
-        content.subviews.forEach { $0.removeFromSuperview() }
+        copyFeedbackWorkItem?.cancel()
+        registerCopyButton = nil
+        hotkeySettings?.cancelRecording()
+        hotkeySettings = nil
+        let previousBody = currentBody
+        content.subviews.filter { $0 !== previousBody }.forEach { $0.removeFromSuperview() }
 
         headerTitle.stringValue = title(for: screen)
         // Progress dots track the three prerequisite steps; the welcome hook has
         // no dots, and done shows them all filled.
         progress.isHidden = screen == .welcome
         if let step = screen.step { progress.setActive(step) }
+        stepCount.isHidden = screen == .done
         stepCount.stringValue = stepLabel(for: screen)
 
         let body: NSView
@@ -214,12 +243,32 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         }
         body.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(body)
+        currentBody = body
         NSLayoutConstraint.activate([
             body.topAnchor.constraint(equalTo: content.topAnchor),
             body.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             body.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             body.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
+
+        guard let previousBody else {
+            body.alphaValue = 1
+            return
+        }
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            previousBody.removeFromSuperview()
+            body.alphaValue = 1
+            return
+        }
+        body.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            previousBody.animator().alphaValue = 0
+            body.animator().alphaValue = 1
+        } completionHandler: {
+            previousBody.removeFromSuperview()
+        }
     }
 
     private func title(for screen: Screen) -> String {
@@ -238,7 +287,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         case .permissions: return "Step 1 of 3"
         case .extensionPairing: return "Step 2 of 3"
         case .registerAgents: return "Step 3 of 3"
-        case .done: return "Done"
+        case .done: return ""
         }
     }
 
@@ -251,9 +300,9 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
         let benefit = benefitLabel(
             lead: "Point at anything on screen. ",
-            rest: "Press your shortcut, drag a box, and your coding agent gets the exact region and what's under it — no copy-paste, no describing.")
+            rest: "Press your shortcut, drag a box, and your coding agent gets the exact region and what's under it. No copy-paste, no describing.")
 
-        let start = LassoButton("Set up Lasso  →", kind: .primary) { [weak self] in
+        let start = LassoButton("Set up Lasso", symbolName: "arrow.right", kind: .primary) { [weak self] in
             self?.go(to: .permissions)
         }
         start.keyEquivalent = "\r"
@@ -273,14 +322,14 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
         let screenRow = PermissionRow(
             name: "Screen Recording",
-            detail: "Required — captures the region you draw over.",
+            detail: "Required: captures the region you draw over.",
             granted: Permissions.hasScreenRecording,
             requirement: "Required",
             action: { Permissions.openScreenRecordingSettings() })
 
         let axRow = PermissionRow(
             name: "Accessibility",
-            detail: "Optional — reads the element's label for cleaner context.",
+            detail: "Optional: reads the element's label for cleaner context.",
             granted: Permissions.hasAccessibility,
             requirement: "Optional",
             action: { Permissions.openAccessibilitySettings() })
@@ -307,7 +356,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
         let benefit = benefitLabel(
             lead: "On web pages, hand over the real element. ",
-            rest: "The browser extension gives your agent the DOM node you pointed at — selector, text, component. Skip it and web captures fall back to a screenshot.")
+            rest: "The browser extension gives your agent the DOM node you pointed at: selector, text, and component. Skip it and web captures fall back to a screenshot.")
 
         let flow = FlowMap()
 
@@ -335,7 +384,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
     private func buildRegister() -> NSView {
         let benefit = benefitLabel(
             lead: "Add Lasso to your coding agent. ",
-            rest: "Pick your client — the same MCP server binary works for all of them.")
+            rest: "Pick your client. The same MCP server binary works for all of them.")
 
         // Client selector: one snippet at a time, switched by the pills.
         let pills = SegmentedPills(
@@ -378,8 +427,11 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             guard let self else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(self.registerSnippet(), forType: .string)
+            self.showCopiedFeedback()
         }
-        let finish = LassoButton("I've added it  →", kind: .primary) { [weak self] in
+        copy.widthAnchor.constraint(equalToConstant: 92).isActive = true
+        registerCopyButton = copy
+        let finish = LassoButton("I've added it", symbolName: "arrow.right", kind: .primary) { [weak self] in
             self?.agentsAcknowledged = true
             self?.go(to: .done)
         }
@@ -393,6 +445,26 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 
     private func registerSnippet() -> String {
         RegistrationSnippet.text(for: registerClient, binaryPath: mcpBinaryPath())
+    }
+
+    private func showCopiedFeedback() {
+        guard let button = registerCopyButton else { return }
+        copyFeedbackWorkItem?.cancel()
+        button.title = "Copied"
+        button.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        button.imagePosition = .imageLeading
+        button.setAccessibilityLabel("Registration command copied")
+
+        let workItem = DispatchWorkItem { [weak self, weak button] in
+            guard let self, self.registerCopyButton === button else { return }
+            button?.title = "Copy"
+            button?.image = nil
+            button?.imagePosition = .noImage
+            button?.setAccessibilityLabel("Copy registration command")
+        }
+        copyFeedbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: workItem)
     }
 
     // MARK: - Done
@@ -409,21 +481,25 @@ final class OnboardingController: NSObject, NSWindowDelegate {
             rest: doneInstructions())
         doneInstructionsLabel = benefit
 
-        let hotkeySettings = HotkeySettingsRow(chord: activeHotkey()) { [weak self] chord in
-            guard let self else { return false }
-            let accepted = self.updateHotkey(chord)
-            if accepted {
-                self.doneInstructionsLabel?.attributedStringValue =
-                    self.benefitAttributed(lead: "That's the whole loop. ", rest: self.doneInstructions())
-                self.demoView?.setHotkeyLabel(chord.description)
-            }
-            return accepted
-        }
+        let hotkeySettings = HotkeySettingsRow(
+            chord: activeHotkey(),
+            onChange: { [weak self] chord in
+                guard let self else { return false }
+                let accepted = self.updateHotkey(chord)
+                if accepted {
+                    self.doneInstructionsLabel?.attributedStringValue =
+                        self.benefitAttributed(lead: "That's the whole loop. ", rest: self.doneInstructions())
+                    self.demoView?.setHotkeyLabel(chord.description)
+                }
+                return accepted
+            },
+            onRecordingChanged: hotkeyEditingChanged)
+        self.hotkeySettings = hotkeySettings
 
         let tip = InfoCard(
             title: "Tip",
             body: extensionSkipped
-                ? "You skipped the browser extension — web captures use a screenshot. Add it anytime from the menu's Setup item for exact DOM context."
+                ? "You skipped the browser extension, so web captures use a screenshot. Add it anytime from the menu's Setup item for exact DOM context."
                 : "Reopen this guide anytime from the menu bar's Setup item.")
 
         let back = LassoButton("Back", kind: .plain) { [weak self] in
@@ -562,6 +638,7 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         timer?.invalidate()
         timer = nil
         demoView?.stop()
+        hotkeySettings?.cancelRecording()
         window.orderOut(nil)
     }
 
@@ -569,6 +646,11 @@ final class OnboardingController: NSObject, NSWindowDelegate {
         timer?.invalidate()
         timer = nil
         demoView?.stop()
+        hotkeySettings?.cancelRecording()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        hotkeySettings?.cancelRecording()
     }
 }
 
@@ -579,14 +661,13 @@ final class OnboardingController: NSObject, NSWindowDelegate {
 final class HotkeySettingsRow: NSView {
     private let recorder: HotkeyRecorder
 
-    init(chord: HotkeyChord, onChange: @escaping (HotkeyChord) -> Bool) {
-        recorder = HotkeyRecorder(chord: chord, onChange: onChange)
+    init(chord: HotkeyChord, showsCard: Bool = true,
+         onChange: @escaping (HotkeyChord) -> Bool,
+         onRecordingChanged: @escaping (Bool) -> Void = { _ in }) {
+        recorder = HotkeyRecorder(chord: chord, onChange: onChange,
+                                  onRecordingChanged: onRecordingChanged)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-
-        let card = GlassCard()
-        card.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(card)
 
         let title = NSTextField(labelWithString: "Capture shortcut")
         title.font = Glass.Font.heading()
@@ -613,24 +694,40 @@ final class HotkeySettingsRow: NSView {
         row.alignment = .centerY
         row.spacing = Glass.Space.md
         row.translatesAutoresizingMaskIntoConstraints = false
-        card.contentView.addSubview(row)
-
-        NSLayoutConstraint.activate([
-            card.topAnchor.constraint(equalTo: topAnchor),
-            card.bottomAnchor.constraint(equalTo: bottomAnchor),
-            card.leadingAnchor.constraint(equalTo: leadingAnchor),
-            card.trailingAnchor.constraint(equalTo: trailingAnchor),
-            row.topAnchor.constraint(equalTo: card.contentView.topAnchor, constant: Glass.Space.md),
-            row.bottomAnchor.constraint(equalTo: card.contentView.bottomAnchor, constant: -Glass.Space.md),
-            row.leadingAnchor.constraint(equalTo: card.contentView.leadingAnchor, constant: Glass.Space.md),
-            row.trailingAnchor.constraint(equalTo: card.contentView.trailingAnchor, constant: -Glass.Space.md),
-        ])
+        if showsCard {
+            let card = GlassCard()
+            card.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(card)
+            card.contentView.addSubview(row)
+            NSLayoutConstraint.activate([
+                card.topAnchor.constraint(equalTo: topAnchor),
+                card.bottomAnchor.constraint(equalTo: bottomAnchor),
+                card.leadingAnchor.constraint(equalTo: leadingAnchor),
+                card.trailingAnchor.constraint(equalTo: trailingAnchor),
+                row.topAnchor.constraint(equalTo: card.contentView.topAnchor, constant: Glass.Space.md),
+                row.bottomAnchor.constraint(equalTo: card.contentView.bottomAnchor, constant: -Glass.Space.md),
+                row.leadingAnchor.constraint(equalTo: card.contentView.leadingAnchor, constant: Glass.Space.md),
+                row.trailingAnchor.constraint(equalTo: card.contentView.trailingAnchor, constant: -Glass.Space.md),
+            ])
+        } else {
+            addSubview(row)
+            NSLayoutConstraint.activate([
+                row.topAnchor.constraint(equalTo: topAnchor),
+                row.bottomAnchor.constraint(equalTo: bottomAnchor),
+                row.leadingAnchor.constraint(equalTo: leadingAnchor),
+                row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            ])
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
 
     func setChord(_ chord: HotkeyChord) {
         recorder.setChord(chord)
+    }
+
+    func cancelRecording() {
+        recorder.cancelRecording()
     }
 }
 
@@ -640,6 +737,7 @@ final class HotkeySettingsRow: NSView {
 private final class HotkeyRecorder: NSControl {
     private let valueLabel = NSTextField(labelWithString: "")
     private let onChange: (HotkeyChord) -> Bool
+    private let onRecordingChanged: (Bool) -> Void
     private var chord: HotkeyChord
     private var isRecording = false
     private var modifierOnlyKeyCode: UInt32?
@@ -648,9 +746,11 @@ private final class HotkeyRecorder: NSControl {
     override var acceptsFirstResponder: Bool { true }
     override var intrinsicContentSize: NSSize { NSSize(width: 132, height: 36) }
 
-    init(chord: HotkeyChord, onChange: @escaping (HotkeyChord) -> Bool) {
+    init(chord: HotkeyChord, onChange: @escaping (HotkeyChord) -> Bool,
+         onRecordingChanged: @escaping (Bool) -> Void) {
         self.chord = chord
         self.onChange = onChange
+        self.onRecordingChanged = onRecordingChanged
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
@@ -676,9 +776,11 @@ private final class HotkeyRecorder: NSControl {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        guard !isRecording else { return }
         isRecording = true
         modifierOnlyKeyCode = nil
         recordedModifiers = []
+        onRecordingChanged(true)
         refreshAppearance()
     }
 
@@ -710,7 +812,7 @@ private final class HotkeyRecorder: NSControl {
             }
             stopRecording()
         } else {
-            valueLabel.stringValue = "\(modifiers.description)…"
+            valueLabel.stringValue = "\(modifiers.description)"
         }
     }
 
@@ -721,11 +823,18 @@ private final class HotkeyRecorder: NSControl {
     }
 
     private func stopRecording() {
+        guard isRecording else { return }
         isRecording = false
         refreshAppearance()
+        onRecordingChanged(false)
+    }
+
+    func cancelRecording() {
+        stopRecording()
     }
 
     func setChord(_ chord: HotkeyChord) {
+        if isRecording { onRecordingChanged(false) }
         isRecording = false
         modifierOnlyKeyCode = nil
         recordedModifiers = []
@@ -734,7 +843,7 @@ private final class HotkeyRecorder: NSControl {
     }
 
     private func refreshAppearance() {
-        valueLabel.stringValue = isRecording ? "Type shortcut…" : chord.description
+        valueLabel.stringValue = isRecording ? "Type shortcut" : chord.description
         valueLabel.textColor = isRecording ? Glass.ink : Glass.muted
         layer?.backgroundColor = NSColor.white.withAlphaComponent(isRecording ? 0.13 : 0.07).cgColor
         layer?.borderColor = (isRecording ? Glass.amberHi : NSColor(white: 1, alpha: 0.14)).cgColor
@@ -795,14 +904,29 @@ private final class ProgressDots: NSView {
 
     func setActive(_ step: OnboardingStep) {
         let activeIndex = steps.firstIndex(of: step) ?? steps.count // done → all filled
-        for (i, dot) in dots.enumerated() {
-            let done = i < activeIndex
-            let current = i == activeIndex
-            widthConstraints[i].constant = current ? 24 : 6
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        CATransaction.begin()
+        CATransaction.setDisableActions(reduceMotion)
+        CATransaction.setAnimationDuration(0.18)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        for (index, dot) in dots.enumerated() {
+            let done = index < activeIndex
+            let current = index == activeIndex
+            widthConstraints[index].constant = current ? 24 : 6
             dot.layer?.backgroundColor = (current
                 ? Glass.ink
                 : (done ? Glass.amberLo : NSColor(white: 1, alpha: 0.14))).cgColor
             dot.layer?.opacity = done ? 0.8 : 1
+        }
+        CATransaction.commit()
+        guard !reduceMotion else {
+            layoutSubtreeIfNeeded()
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().layoutSubtreeIfNeeded()
         }
     }
 }
@@ -1098,12 +1222,13 @@ private final class FlowMap: NSView {
     }
 
     private static func arrow() -> NSView {
-        let l = NSTextField(labelWithString: "→")
-        l.font = .systemFont(ofSize: 16, weight: .medium)
-        l.textColor = Glass.amberLo
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.setContentHuggingPriority(.required, for: .horizontal)
-        return l
+        let image = NSImageView()
+        image.image = NSImage(systemSymbolName: "arrow.right", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .medium))
+        image.contentTintColor = Glass.amberLo
+        image.translatesAutoresizingMaskIntoConstraints = false
+        image.setContentHuggingPriority(.required, for: .horizontal)
+        return image
     }
 }
 
@@ -1231,7 +1356,7 @@ private final class StatusChip: NSView {
         dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
 
-        let l = NSTextField(labelWithString: paired ? "Extension paired" : "Waiting to pair…")
+        let l = NSTextField(labelWithString: paired ? "Extension paired" : "Waiting to pair")
         l.font = Glass.Font.caption()
         l.textColor = Glass.muted
         l.translatesAutoresizingMaskIntoConstraints = false
@@ -1508,7 +1633,7 @@ private final class GestureDemoView: NSView {
         mark.translatesAutoresizingMaskIntoConstraints = false
         tickDot.addSubview(mark)
 
-        let text = NSTextField(labelWithString: "Captured — your agent can read it")
+        let text = NSTextField(labelWithString: "Captured. Your agent can read it")
         text.font = .systemFont(ofSize: 11.5, weight: .regular)
         text.textColor = Glass.ink
         text.translatesAutoresizingMaskIntoConstraints = false

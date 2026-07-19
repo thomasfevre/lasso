@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lasso",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Hands the on-screen element you gesture over to your coding agent, via the Lasso Conductor.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4xEnqltjQweRlGuduyTFyQmiTzd+uESwALxht0/HmBddWlNfQxEb4ibw2lmD25ZZH1Cn/4Umdu+FH9tsocMuiprVq04R/RtFVM19wWBoxyAu2QbojwO+9K3y0NaDluA3CnWySfiNkTPOk7DHxHjeYRPO+GMhin/SiOYoACDzR3JiwgoKBcT+VlF7D3AYDl1Udb1WfpGcyeBai+7VnH84h4cyGDsH8yYmfnBvfE0hs5LAxwsM0KpOZ12xdM/PPU5rEHlYEA2Cj33J9ToZwbXxlhmxUX/F8ujpn8Z5hI+rp5CvNgp//Tmeql7STLurHdAw9z/ik2+d9vVwLYY3b1TA7wIDAQAB",
   "background": { "service_worker": "background.js", "type": "module" },

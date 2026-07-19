@@ -43,18 +43,32 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertEqual(try store.activeTags(), ["bug", "Review"])
     }
 
-    func testSearchUsesOnlyTagsNotesPinsAndWindowMetadata() throws {
+    func testSearchIncludesOCRTextAlongsideNotesPinsTagsAndWindowMetadata() throws {
         let store = try Store(directory: directory)
         let matching = try store.insert(imagePNG: png,
                                         context: CaptureContext(appName: "Safari", windowTitle: "Dashboard review"),
                                         note: "check spacing", markers: [Marker(index: 1, x: 0.5, y: 0.5, note: "CTA")])
         try store.updateTags(["client-a"], id: matching.id)
-        _ = try store.insert(imagePNG: png,
-                             context: CaptureContext(text: "secret unique OCR phrase"), note: nil)
+        let ocrOnly = try store.insert(imagePNG: png,
+                                       context: CaptureContext(text: "secret unique OCR phrase"), note: nil)
+        let domOnly = try store.insert(
+            imagePNG: png,
+            context: CaptureContext(
+                source: .dom,
+                dom: DOMFingerprint(
+                    selector: "main > section",
+                    text: "Quarterly pipeline",
+                    nearbyText: "Revenue forecast"
+                )
+            ),
+            note: nil
+        )
 
         XCTAssertEqual(try store.searchCaptures(query: "dashboard").map(\.id), [matching.id])
         XCTAssertEqual(try store.searchCaptures(query: "cta").map(\.id), [matching.id])
-        XCTAssertEqual(try store.searchCaptures(query: "unique OCR phrase").map(\.id), [])
+        XCTAssertEqual(try store.searchCaptures(query: "unique OCR phrase").map(\.id), [ocrOnly.id])
+        XCTAssertEqual(try store.searchCaptures(query: "Quarterly pipeline").map(\.id), [domOnly.id])
+        XCTAssertEqual(try store.searchCaptures(query: "Revenue forecast").map(\.id), [domOnly.id])
         XCTAssertEqual(try store.searchCaptures(query: "", tag: "client-a").map(\.id), [matching.id])
         XCTAssertFalse((try store.activeTags()).contains("unused"))
     }
@@ -110,7 +124,21 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appendingPathComponent(secondTrash.imageFile).path))
     }
 
-    func testEmptyRecentlyDeletedStopsAtFailedCleanupUnitAndLeavesItRetryable() throws {
+    func testLibraryStateCountsAreExactAndExcludeOtherStates() throws {
+        let store = try Store(directory: directory)
+        let recent = try store.insert(imagePNG: png, context: CaptureContext(), note: "recent")
+        let kept = try store.insert(imagePNG: png, context: CaptureContext(), note: "kept")
+        let deleted = try store.insert(imagePNG: png, context: CaptureContext(), note: "deleted")
+        try store.setKept(true, id: kept.id)
+        try store.moveToTrash(id: deleted.id)
+
+        XCTAssertEqual(try store.count(in: .recent), 1)
+        XCTAssertEqual(try store.count(in: .kept), 1)
+        XCTAssertEqual(try store.count(in: .recentlyDeleted), 1)
+        XCTAssertEqual(try store.capture(id: recent.id)?.libraryState, .recent)
+    }
+
+    func testEmptyRecentlyDeletedNeverRestoresARowAfterItsImageCleanupFails() throws {
         let store = try Store(directory: directory)
         let first = try store.insert(imagePNG: png, context: CaptureContext(), note: "first")
         let blocked = try store.insert(imagePNG: png, context: CaptureContext(), note: "blocked")
@@ -129,10 +157,10 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: directory.appendingPathComponent(first.imageFile).path
         ))
-        XCTAssertNotNil(try store.capture(id: blocked.id))
+        XCTAssertNil(try store.capture(id: blocked.id))
         XCTAssertTrue(FileManager.default.fileExists(atPath: blockedURL.path))
-        XCTAssertNotNil(try store.capture(id: untouched.id))
-        XCTAssertTrue(FileManager.default.fileExists(
+        XCTAssertNil(try store.capture(id: untouched.id))
+        XCTAssertFalse(FileManager.default.fileExists(
             atPath: directory.appendingPathComponent(untouched.imageFile).path
         ))
     }

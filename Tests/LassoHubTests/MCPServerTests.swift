@@ -1,6 +1,10 @@
 import XCTest
 import LassoCore
 @testable import LassoHub
+#if canImport(CoreGraphics) && canImport(ImageIO)
+import CoreGraphics
+import ImageIO
+#endif
 
 // Protocol-level tests for the Hub: drive `response(forLine:)` directly, no
 // process spawn. Covers the MCP handshake, tool listing, empty-store behaviour,
@@ -8,7 +12,12 @@ import LassoCore
 // validation (the council's blocking finding on SPE-544).
 final class MCPServerTests: XCTestCase {
     private var dir: URL!
-    private var png: Data { Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) }
+    private var png: Data {
+        // Valid 1 x 1 PNG so image preprocessing tests exercise the same wire
+        // contract as production captures on every supported test platform.
+        Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")!
+    }
 
     override func setUpWithError() throws {
         dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -20,6 +29,82 @@ final class MCPServerTests: XCTestCase {
     }
 
     private func server() -> MCPServer { MCPServer(storeDirectory: dir) }
+
+    private func latestNote(from server: MCPServer) throws -> String? {
+        let request: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": ["name": MCPServer.toolName, "arguments": [String: Any]()],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: request)
+        return try summary(from: server.response(forLine: data))["note"] as? String
+    }
+
+    func testLiveServerFollowsAChangedStoreDirectoryProvider() throws {
+        let firstDirectory = dir!
+        let secondDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("lasso-mcp-moved-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: secondDirectory) }
+        let firstStore = try Store(directory: firstDirectory)
+        _ = try firstStore.insert(imagePNG: png, context: CaptureContext(), note: "first library")
+        let secondStore = try Store(directory: secondDirectory)
+        _ = try secondStore.insert(imagePNG: png, context: CaptureContext(), note: "second library")
+
+        var currentDirectory = firstDirectory
+        let liveServer = MCPServer(storeDirectoryProvider: { currentDirectory })
+        XCTAssertEqual(try latestNote(from: liveServer), "first library")
+
+        currentDirectory = secondDirectory
+        XCTAssertEqual(try latestNote(from: liveServer), "second library")
+    }
+
+    func testLatestSkipsABrokenNewestImageAndKeepsItsLatestID() throws {
+        let writer = try Store(directory: dir)
+        let fallback = try writer.insert(
+            imagePNG: png,
+            context: CaptureContext(),
+            note: "readable fallback"
+        )
+        let brokenNewest = try writer.insert(
+            imagePNG: png,
+            context: CaptureContext(),
+            note: "broken newest"
+        )
+        try FileManager.default.removeItem(
+            at: dir.appendingPathComponent(brokenNewest.imageFile)
+        )
+
+        let response = try call([String: Any]())
+        let result = try XCTUnwrap(response?["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        XCTAssertFalse(try imageData(from: response).isEmpty)
+        let payload = try summary(from: response)
+        XCTAssertEqual((payload["id"] as? NSNumber)?.int64Value, fallback.id)
+        XCTAssertEqual((payload["latest_id"] as? NSNumber)?.int64Value, brokenNewest.id)
+    }
+
+    func testLatestSkipsANewestImageThatCannotBeDecoded() throws {
+        let writer = try Store(directory: dir)
+        let fallback = try writer.insert(
+            imagePNG: png,
+            context: CaptureContext(),
+            note: "readable fallback"
+        )
+        let corruptNewest = try writer.insert(
+            imagePNG: Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            context: CaptureContext(),
+            note: "corrupt newest"
+        )
+
+        let response = try call([String: Any]())
+        let result = try XCTUnwrap(response?["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        XCTAssertFalse(try imageData(from: response).isEmpty)
+        let payload = try summary(from: response)
+        XCTAssertEqual((payload["id"] as? NSNumber)?.int64Value, fallback.id)
+        XCTAssertEqual((payload["latest_id"] as? NSNumber)?.int64Value, corruptNewest.id)
+    }
 
     private func send(_ request: [String: Any]) throws -> [String: Any]? {
         let data = try JSONSerialization.data(withJSONObject: request)
@@ -46,6 +131,50 @@ final class MCPServerTests: XCTestCase {
         return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
+    private func imageData(from response: [String: Any]?) throws -> Data {
+        let result = try XCTUnwrap(response?["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let encoded = try XCTUnwrap(content.first?["data"] as? String)
+        return try XCTUnwrap(Data(base64Encoded: encoded))
+    }
+
+#if canImport(CoreGraphics) && canImport(ImageIO)
+    private func makePNG(width: Int, height: Int) throws -> Data {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 0.17, green: 0.31, blue: 0.53, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let output = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(
+            output,
+            "public.png" as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return output as Data
+    }
+
+    private func imageDimensions(_ data: Data) throws -> (width: Int, height: Int) {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let properties = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any])
+        let width = try XCTUnwrap(properties[kCGImagePropertyPixelWidth] as? NSNumber).intValue
+        let height = try XCTUnwrap(properties[kCGImagePropertyPixelHeight] as? NSNumber).intValue
+        return (width, height)
+    }
+#endif
+
     // MARK: - handshake
 
     func testInitialize() throws {
@@ -55,6 +184,7 @@ final class MCPServerTests: XCTestCase {
         XCTAssertEqual(result["protocolVersion"] as? String, "2024-11-05")
         let info = try XCTUnwrap(result["serverInfo"] as? [String: Any])
         XCTAssertEqual(info["name"] as? String, "lasso-mcp")
+        XCTAssertEqual(info["version"] as? String, "0.1.2")
     }
 
     func testInitializedNotificationHasNoResponse() throws {
@@ -92,6 +222,74 @@ final class MCPServerTests: XCTestCase {
         XCTAssertEqual((s["latest_id"] as? NSNumber)?.int64Value, written.id)
         XCTAssertNotNil(s["age_seconds"] as? NSNumber)
         XCTAssertEqual(s["note"] as? String, "look here")
+    }
+
+#if canImport(CoreGraphics) && canImport(ImageIO)
+    func testLargeCaptureIsDownsampledForLatestWithoutChangingStoredOriginal() throws {
+        let original = try makePNG(width: 2400, height: 1200)
+        let store = try Store(directory: dir)
+        let capture = try store.insert(
+            imagePNG: original,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+
+        let delivered = try imageData(from: try call([:]))
+        let deliveredSize = try imageDimensions(delivered)
+        XCTAssertEqual(deliveredSize.width, MCPServer.maximumImageLongSide)
+        XCTAssertEqual(deliveredSize.height, MCPServer.maximumImageLongSide / 2)
+
+        let stored = try store.imageData(for: capture)
+        XCTAssertEqual(stored, original)
+        let storedSize = try imageDimensions(stored)
+        XCTAssertEqual(storedSize.width, 2400)
+        XCTAssertEqual(storedSize.height, 1200)
+    }
+
+    func testLargeCaptureIsDownsampledForGetCapture() throws {
+        let original = try makePNG(width: 1200, height: 2400)
+        let store = try Store(directory: dir)
+        let capture = try store.insert(
+            imagePNG: original,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+
+        let delivered = try imageData(from: try callGet(["id": Int(capture.id)]))
+        let size = try imageDimensions(delivered)
+        XCTAssertEqual(size.width, MCPServer.maximumImageLongSide / 2)
+        XCTAssertEqual(size.height, MCPServer.maximumImageLongSide)
+    }
+
+    func testCaptureWithinLimitIsReturnedByteForByte() throws {
+        let original = try makePNG(width: 1200, height: 800)
+        let store = try Store(directory: dir)
+        try store.insert(
+            imagePNG: original,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+
+        XCTAssertEqual(try imageData(from: try call([:])), original)
+    }
+#endif
+
+    func testMalformedOnlyCaptureIsSkippedInsteadOfBypassingImageCap() throws {
+        let signatureOnly = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let store = try Store(directory: dir)
+        try store.insert(
+            imagePNG: signatureOnly,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+
+        let response = try call([:])
+        let result = try XCTUnwrap(response?["result"] as? [String: Any])
+        XCTAssertEqual(result["isError"] as? Bool, false)
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 1, "a malformed Capture must never produce an image block")
+        let payload = try summary(from: response)
+        XCTAssertTrue(payload["capture"] is NSNull)
     }
 
     func testAfterIdSuppressesSeenCapture() throws {
@@ -417,6 +615,8 @@ final class MCPServerTests: XCTestCase {
         XCTAssertTrue(latest["capture"] is NSNull)
         let listed = try summary(from: try callList(nil))
         XCTAssertEqual((listed["captures"] as? [[String: Any]])?.count, 0)
+        let fetched = try summary(from: try callGet(["id": Int(capture.id)]))
+        XCTAssertTrue(fetched["capture"] is NSNull)
     }
 
     func testListRecentRejectsBadLimit() throws {

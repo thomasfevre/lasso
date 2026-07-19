@@ -1,5 +1,10 @@
 import XCTest
 @testable import LassoCore
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 // SPE-550: several Agents each spawn their own Hub, all reading one Store the
 // Conductor writes. These assert the multi-client guarantees at the Store level:
@@ -182,5 +187,85 @@ final class ConcurrencyTests: XCTestCase {
         // A write committed after the reader opened is visible on the next query.
         let second = try writer.insert(imagePNG: png, context: CaptureContext(source: .none), note: nil)
         XCTAssertEqual(try reader.latest()?.id, second.id)
+    }
+
+    func testCaptureStateMutationWaitsForCrossProcessReadLock() throws {
+        let writer = try Store(directory: dir)
+        let capture = try writer.insert(
+            imagePNG: png,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+        let lockFD = open(
+            dir.appendingPathComponent(".capture-lifecycle.lock").path,
+            O_RDWR | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(lockFD, 0)
+        guard lockFD >= 0 else { return }
+        defer { close(lockFD) }
+        XCTAssertEqual(flock(lockFD, LOCK_SH), 0)
+
+        let writerStarted = DispatchSemaphore(value: 0)
+        let writerFinished = DispatchSemaphore(value: 0)
+        let errorsLock = NSLock()
+        var errors: [Error] = []
+
+        DispatchQueue.global().async {
+            writerStarted.signal()
+            do {
+                try writer.moveToTrash(id: capture.id)
+            } catch {
+                errorsLock.lock(); errors.append(error); errorsLock.unlock()
+            }
+            writerFinished.signal()
+        }
+        XCTAssertEqual(writerStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(
+            writerFinished.wait(timeout: .now() + 0.15),
+            .timedOut,
+            "moving a Capture must wait until an in-flight read has finished"
+        )
+
+        XCTAssertEqual(flock(lockFD, LOCK_UN), 0)
+        XCTAssertEqual(writerFinished.wait(timeout: .now() + 1), .success)
+        errorsLock.lock(); let capturedErrors = errors; errorsLock.unlock()
+        XCTAssertTrue(capturedErrors.isEmpty, "concurrent lifecycle operations failed: \(capturedErrors)")
+        XCTAssertEqual(try writer.capture(id: capture.id)?.libraryState, .recentlyDeleted)
+    }
+
+    func testCaptureStateMutationTimesOutInsteadOfBlockingForever() throws {
+        let writer = try Store(directory: dir)
+        let capture = try writer.insert(
+            imagePNG: png,
+            context: CaptureContext(source: .none),
+            note: nil
+        )
+        let lockFD = open(
+            dir.appendingPathComponent(".capture-lifecycle.lock").path,
+            O_RDWR | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(lockFD, 0)
+        guard lockFD >= 0 else { return }
+        defer { close(lockFD) }
+        XCTAssertEqual(flock(lockFD, LOCK_SH), 0)
+
+        let finished = DispatchSemaphore(value: 0)
+        let resultLock = NSLock()
+        var result: Result<Void, Error>?
+        DispatchQueue.global().async {
+            let attempt = Result { try writer.moveToTrash(id: capture.id) }
+            resultLock.lock(); result = attempt; resultLock.unlock()
+            finished.signal()
+        }
+
+        XCTAssertEqual(finished.wait(timeout: .now() + 3), .success)
+        resultLock.lock(); let capturedResult = result; resultLock.unlock()
+        guard case .failure(let error) = capturedResult else {
+            XCTFail("mutation unexpectedly acquired a permanently held lifecycle lock")
+            return
+        }
+        XCTAssertTrue(String(describing: error).contains("busy for too long"))
+        XCTAssertEqual(try writer.capture(id: capture.id)?.libraryState, .recent)
+        XCTAssertEqual(flock(lockFD, LOCK_UN), 0)
     }
 }

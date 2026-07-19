@@ -98,6 +98,40 @@ public struct CaptureRequest: Equatable, Sendable {
     }
 }
 
+/// Immutable Capture data copied while the Capture is active. Consumers can do
+/// expensive image processing after the Store releases its lifecycle lock.
+public struct CaptureImageSnapshot: Sendable, Equatable {
+    public let capture: Capture
+    public let imagePNG: Data
+
+    public init(capture: Capture, imagePNG: Data) {
+        self.capture = capture
+        self.imagePNG = imagePNG
+    }
+}
+
+/// A stable active-library listing and the newest active id observed with it.
+public struct CaptureListSnapshot: Sendable, Equatable {
+    public let latestID: Int64?
+    public let captures: [Capture]
+
+    public init(latestID: Int64?, captures: [Capture]) {
+        self.latestID = latestID
+        self.captures = captures
+    }
+}
+
+/// A specific Capture lookup plus the newest active id from the same snapshot.
+public struct CaptureLookupSnapshot: Sendable, Equatable {
+    public let latestID: Int64?
+    public let capture: CaptureImageSnapshot?
+
+    public init(latestID: Int64?, capture: CaptureImageSnapshot?) {
+        self.latestID = latestID
+        self.capture = capture
+    }
+}
+
 /// The Store: an ephemeral local spool of Captures (SQLite + PNG files) owned by
 /// the Conductor and read by every Hub (ADR 0009), plus a separate request
 /// channel that Hubs may write (ADR 0012). Only the Conductor's capture path
@@ -110,10 +144,12 @@ public final class Store {
     /// Raw PNG bytes are bounded before allocation/base64 encoding by the Hub.
     public static let maximumImageBytes = 25 * 1024 * 1024
     private static let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    private static let captureLifecycleLockTimeout: TimeInterval = 2
 
     public let directory: URL
     private let dbPath: URL
     private let directoryFD: Int32
+    private let captureLifecycleLockFD: Int32
     private var db: OpaquePointer?
     private let retention: Retention
     private let access: StoreAccess
@@ -156,14 +192,19 @@ public final class Store {
         }
         let openedDirectoryFD = try Store.openStoreDirectory(directory)
         self.directoryFD = openedDirectoryFD
+        var openedLifecycleLockFD: Int32 = -1
         var openedHandle: OpaquePointer?
         var initialized = false
         defer {
             if !initialized {
                 if let openedHandle { sqlite3_close(openedHandle) }
+                if openedLifecycleLockFD >= 0 { close(openedLifecycleLockFD) }
                 close(openedDirectoryFD)
             }
         }
+
+        openedLifecycleLockFD = try Store.openCaptureLifecycleLock(directoryFD: openedDirectoryFD)
+        self.captureLifecycleLockFD = openedLifecycleLockFD
 
         try Store.secureSQLiteFile(
             directoryFD: openedDirectoryFD,
@@ -327,18 +368,25 @@ public final class Store {
 
     deinit {
         if let db { sqlite3_close(db) }
+        close(captureLifecycleLockFD)
         close(directoryFD)
     }
 
     /// Test-only view of whether the markers column was detected/migrated.
     var hasMarkersColumnForTesting: Bool { hasMarkersColumn }
 
-    /// The default Store location. macOS uses the fixed Application Support path
-    /// (ADR 0009); other platforms fall back to the user data dir (used for the
-    /// Linux test/dev build). `LASSO_STORE_DIR` overrides both.
-    public static func defaultDirectory(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL {
+    /// The default Store location. An explicit environment override wins for
+    /// automation; otherwise all Lasso processes honor the user's chosen
+    /// library folder before falling back to Application Support.
+    public static func defaultDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        configuredDirectory: URL? = StoreLocationPreference.configuredDirectory
+    ) -> URL {
         if let override = environment["LASSO_STORE_DIR"], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        if let configured = configuredDirectory {
+            return configured
         }
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -353,80 +401,97 @@ public final class Store {
     public func insert(imagePNG: Data, context: CaptureContext, note: String?,
                        markers: [Marker] = [], redactionStatus: RedactionStatus = .none,
                        now: Date = Date()) throws -> Capture {
-        guard access == .captureWriter else {
-            throw StoreError.access("only the Conductor capture writer may insert Captures")
-        }
-        // Validate markers before doing anything expensive.
-        for marker in markers where !marker.isValid {
-            throw StoreError.invalidMarker("index \(marker.index) at (\(marker.x), \(marker.y))")
-        }
-        // Pin numbers must be unique, otherwise a marker reference is ambiguous.
-        let indices = markers.map(\.index)
-        if Set(indices).count != indices.count {
-            throw StoreError.invalidMarker("duplicate pin index in \(indices)")
-        }
-
-        // Prepare everything that can fail cheaply before touching the disk, so
-        // a bad row never leaves an orphan PNG behind.
-        let domJSON = try context.dom.map { try encodeDOM($0) }
-        let markersJSON = try markers.isEmpty ? nil : encodeMarkers(markers)
-        let stmt = try prepare("""
-        INSERT INTO captures (created_at, image_file, source, text, dom_json, note, markers_json, app_name, window_title, layout, redaction_status, tags_json, library_state, deleted_at, deleted_from_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'recent', NULL, NULL);
-        """)
-        defer { sqlite3_finalize(stmt) }
-
-        let fileName = UUID().uuidString + ".png"
-        var wroteImage = false
-        do {
-            let fd = openat(directoryFD, fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-            guard fd >= 0 else { throw StoreError.imageWrite(Store.systemError()) }
-            guard fchmod(fd, 0o600) == 0 else {
-                let message = Store.systemError()
-                close(fd)
-                throw StoreError.imageWrite(message)
+        try withCaptureWriteLock {
+            guard access == .captureWriter else {
+                throw StoreError.access("only the Conductor capture writer may insert Captures")
             }
-            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-            try handle.write(contentsOf: imagePNG)
-            try handle.close()
-            wroteImage = true
-        } catch {
-            if !wroteImage { unlinkat(directoryFD, fileName, 0) }
-            if let error = error as? StoreError { throw error }
-            throw StoreError.imageWrite(error.localizedDescription)
+            // Validate markers before doing anything expensive.
+            for marker in markers where !marker.isValid {
+                throw StoreError.invalidMarker("index \(marker.index) at (\(marker.x), \(marker.y))")
+            }
+            // Pin numbers must be unique, otherwise a marker reference is ambiguous.
+            let indices = markers.map(\.index)
+            if Set(indices).count != indices.count {
+                throw StoreError.invalidMarker("duplicate pin index in \(indices)")
+            }
+
+            // Prepare everything that can fail cheaply before touching the disk, so
+            // a bad row never leaves an orphan PNG behind.
+            let domJSON = try context.dom.map { try encodeDOM($0) }
+            let markersJSON = try markers.isEmpty ? nil : encodeMarkers(markers)
+            let stmt = try prepare("""
+            INSERT INTO captures (created_at, image_file, source, text, dom_json, note, markers_json, app_name, window_title, layout, redaction_status, tags_json, library_state, deleted_at, deleted_from_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'recent', NULL, NULL);
+            """)
+            defer { sqlite3_finalize(stmt) }
+
+            let fileName = UUID().uuidString + ".png"
+            var wroteImage = false
+            do {
+                let fd = openat(directoryFD, fileName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                guard fd >= 0 else { throw StoreError.imageWrite(Store.systemError()) }
+                guard fchmod(fd, 0o600) == 0 else {
+                    let message = Store.systemError()
+                    close(fd)
+                    throw StoreError.imageWrite(message)
+                }
+                let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+                try handle.write(contentsOf: imagePNG)
+                try handle.close()
+                wroteImage = true
+            } catch {
+                if !wroteImage { unlinkat(directoryFD, fileName, 0) }
+                if let error = error as? StoreError { throw error }
+                throw StoreError.imageWrite(error.localizedDescription)
+            }
+
+            sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
+            bindText(stmt, 2, fileName)
+            bindText(stmt, 3, context.source.rawValue)
+            bindText(stmt, 4, context.text)
+            bindText(stmt, 5, domJSON)
+            bindText(stmt, 6, note)
+            bindText(stmt, 7, markersJSON)
+            bindText(stmt, 8, context.appName)
+            bindText(stmt, 9, context.windowTitle)
+            bindText(stmt, 10, context.layout?.rawValue)
+            bindText(stmt, 11, redactionStatus.rawValue)
+
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                // Don't leave the PNG behind if the row didn't land.
+                unlinkat(directoryFD, fileName, 0)
+                throw StoreError.sql(lastErrorMessage())
+            }
+            let id = sqlite3_last_insert_rowid(db)
+
+            // Retention is best-effort: the Capture is already stored, so a purge
+            // failure must not fail the write.
+            do { try purge(now: now) } catch { /* keep the capture; spool stays a bit long */ }
+
+            return Capture(id: id, createdAt: now, imageFile: fileName, note: note,
+                           context: context, markers: markers, redactionStatus: redactionStatus)
         }
-
-        sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
-        bindText(stmt, 2, fileName)
-        bindText(stmt, 3, context.source.rawValue)
-        bindText(stmt, 4, context.text)
-        bindText(stmt, 5, domJSON)
-        bindText(stmt, 6, note)
-        bindText(stmt, 7, markersJSON)
-        bindText(stmt, 8, context.appName)
-        bindText(stmt, 9, context.windowTitle)
-        bindText(stmt, 10, context.layout?.rawValue)
-        bindText(stmt, 11, redactionStatus.rawValue)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            // Don't leave the PNG behind if the row didn't land.
-            unlinkat(directoryFD, fileName, 0)
-            throw StoreError.sql(lastErrorMessage())
-        }
-        let id = sqlite3_last_insert_rowid(db)
-
-        // Retention is best-effort: the Capture is already stored, so a purge
-        // failure must not fail the write.
-        do { try purge(now: now) } catch { /* keep the capture; spool stays a bit long */ }
-
-        return Capture(id: id, createdAt: now, imageFile: fileName, note: note,
-                       context: context, markers: markers, redactionStatus: redactionStatus)
     }
 
     /// Number of Captures currently retained.
     public func count() throws -> Int {
         let stmt = try prepare("SELECT COUNT(*) FROM captures;")
         defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.sql(lastErrorMessage()) }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
+    /// Number of captures in one visible library section. This is deliberately
+    /// a database count rather than a count of a paged grid, so destructive UI
+    /// can state exactly how many captures it will affect.
+    public func count(in state: CaptureLibraryState) throws -> Int {
+        guard hasCapturesTable else { return 0 }
+        guard hasLibraryColumns else {
+            return state == .recent ? try count() : 0
+        }
+        let stmt = try prepare("SELECT COUNT(*) FROM captures WHERE library_state = ?;")
+        defer { sqlite3_finalize(stmt) }
+        bindText(stmt, 1, state.rawValue)
         guard sqlite3_step(stmt) == SQLITE_ROW else { throw StoreError.sql(lastErrorMessage()) }
         return Int(sqlite3_column_int64(stmt, 0))
     }
@@ -447,9 +512,8 @@ public final class Store {
         return out
     }
 
-    /// Finds captures using the deliberately small, user-visible search surface:
-    /// tags, capture/pin notes, app name, and window title. It never searches
-    /// OCR or DOM payloads, which can be noisy and privacy-sensitive.
+    /// Finds captures using the user-visible search surface: OCR/DOM text, tags,
+    /// capture/pin notes, app name, and window title.
     public func searchCaptures(query: String, state: CaptureLibraryState? = nil,
                                tag: String? = nil, limit: Int = 1_000) throws -> [Capture] {
         let source: [Capture]
@@ -473,8 +537,25 @@ public final class Store {
                 return false
             }
             guard let needle else { return true }
-            let fields = capture.tags + [capture.note, capture.context.appName, capture.context.windowTitle]
-                .compactMap { $0 } + capture.markers.compactMap(\.note)
+            let contextFields = [
+                capture.note,
+                capture.context.text,
+                capture.context.dom?.text,
+                capture.context.dom?.nearbyText,
+                capture.context.dom?.componentName,
+                capture.context.appName,
+                capture.context.windowTitle,
+            ].compactMap { $0 }
+            let markerFields = capture.markers.flatMap { marker in
+                [
+                    marker.note,
+                    marker.text,
+                    marker.dom?.text,
+                    marker.dom?.nearbyText,
+                    marker.dom?.componentName,
+                ].compactMap { $0 }
+            }
+            let fields = capture.tags + contextFields + markerFields
             return fields.contains { $0.localizedCaseInsensitiveContains(needle) }
         }
     }
@@ -504,82 +585,136 @@ public final class Store {
     }
 
     public func setKept(_ kept: Bool, id: Int64) throws {
-        try requireCaptureWriter()
-        guard hasLibraryColumns else { return }
-        let stmt = try prepare("UPDATE captures SET library_state = ?, deleted_at = NULL, deleted_from_state = NULL WHERE id = ? AND library_state != 'recentlyDeleted';")
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, kept ? CaptureLibraryState.kept.rawValue : CaptureLibraryState.recent.rawValue)
-        sqlite3_bind_int64(stmt, 2, id)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasLibraryColumns else { return }
+            let stmt = try prepare("UPDATE captures SET library_state = ?, deleted_at = NULL, deleted_from_state = NULL WHERE id = ? AND library_state != 'recentlyDeleted';")
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, kept ? CaptureLibraryState.kept.rawValue : CaptureLibraryState.recent.rawValue)
+            sqlite3_bind_int64(stmt, 2, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        }
     }
 
     public func moveToTrash(id: Int64, now: Date = Date()) throws {
-        try requireCaptureWriter()
-        guard hasLibraryColumns else { return }
-        let stmt = try prepare("UPDATE captures SET deleted_from_state = library_state, library_state = 'recentlyDeleted', deleted_at = ? WHERE id = ? AND library_state != 'recentlyDeleted';")
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
-        sqlite3_bind_int64(stmt, 2, id)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasLibraryColumns else { return }
+            let stmt = try prepare("UPDATE captures SET deleted_from_state = library_state, library_state = 'recentlyDeleted', deleted_at = ? WHERE id = ? AND library_state != 'recentlyDeleted';")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
+            sqlite3_bind_int64(stmt, 2, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        }
     }
 
     public func restore(id: Int64) throws {
-        try requireCaptureWriter()
-        guard hasLibraryColumns else { return }
-        let stmt = try prepare("UPDATE captures SET library_state = COALESCE(deleted_from_state, 'recent'), deleted_at = NULL, deleted_from_state = NULL WHERE id = ? AND library_state = 'recentlyDeleted';")
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_int64(stmt, 1, id)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasLibraryColumns else { return }
+            let stmt = try prepare("UPDATE captures SET library_state = COALESCE(deleted_from_state, 'recent'), deleted_at = NULL, deleted_from_state = NULL WHERE id = ? AND library_state = 'recentlyDeleted';")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        }
     }
 
     public func updateTags(_ tags: [String], id: Int64) throws {
-        try requireCaptureWriter()
-        guard hasTagsColumn else { return }
-        let normalized = CaptureTag.normalize(tags)
-        let json = try String(data: JSONEncoder().encode(normalized), encoding: .utf8)
-        let stmt = try prepare("UPDATE captures SET tags_json = ? WHERE id = ?;")
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, 1, json)
-        sqlite3_bind_int64(stmt, 2, id)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasTagsColumn else { return }
+            let normalized = CaptureTag.normalize(tags)
+            let json = try String(data: JSONEncoder().encode(normalized), encoding: .utf8)
+            let stmt = try prepare("UPDATE captures SET tags_json = ? WHERE id = ?;")
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, 1, json)
+            sqlite3_bind_int64(stmt, 2, id)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        }
     }
 
     public func permanentlyErase(id: Int64) throws {
-        try requireCaptureWriter()
-        guard let capture = try capture(id: id) else { return }
-        try eraseCaptureRows([id: capture.imageFile])
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard let capture = try capture(id: id) else { return }
+            try eraseCaptureRows([id: capture.imageFile])
+        }
     }
 
     /// Permanently removes every Capture in Recently Deleted and its PNG.
     /// Returns the number removed so callers can report an honest result.
     @discardableResult
     public func emptyRecentlyDeleted() throws -> Int {
-        try requireCaptureWriter()
-        guard hasLibraryColumns else { return 0 }
-        var victims: [Int64: String] = [:]
-        let stmt = try prepare(
-            "SELECT id, image_file FROM captures WHERE library_state = 'recentlyDeleted';"
-        )
-        collect(stmt, into: &victims)
-        sqlite3_finalize(stmt)
-        try eraseCaptureRows(victims)
-        return victims.count
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasLibraryColumns else { return 0 }
+            var victims: [Int64: String] = [:]
+            let stmt = try prepare(
+                "SELECT id, image_file FROM captures WHERE library_state = 'recentlyDeleted';"
+            )
+            collect(stmt, into: &victims)
+            sqlite3_finalize(stmt)
+            try eraseCaptureRows(victims)
+            return victims.count
+        }
     }
 
     public func clearRecent(now: Date = Date()) throws {
-        try requireCaptureWriter()
-        guard hasLibraryColumns else { return }
-        let stmt = try prepare("UPDATE captures SET deleted_from_state = 'recent', library_state = 'recentlyDeleted', deleted_at = ? WHERE library_state = 'recent';")
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
-        guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            guard hasLibraryColumns else { return }
+            let stmt = try prepare("UPDATE captures SET deleted_from_state = 'recent', library_state = 'recentlyDeleted', deleted_at = ? WHERE library_state = 'recent';")
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, now.timeIntervalSince1970)
+            guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
+        }
     }
 
     /// Applies the configured retention immediately, used after changing the
     /// library setting rather than waiting for the next capture.
     public func applyRetention(now: Date = Date()) throws {
-        try requireCaptureWriter()
-        try purge(now: now)
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            try purge(now: now)
+        }
+    }
+
+    /// Removes writer-named PNG files that no Capture row references. This
+    /// completes cleanup after a prior filesystem failure without ever making
+    /// a live Capture lose its image.
+    @discardableResult
+    public func removeOrphanedCaptureImages(
+        olderThan minimumAge: TimeInterval = 0,
+        now: Date = Date()
+    ) throws -> Int {
+        try withCaptureWriteLock {
+            try requireCaptureWriter()
+            var referenced = Set<String>()
+            if hasCapturesTable {
+                let stmt = try prepare("SELECT image_file FROM captures;")
+                defer { sqlite3_finalize(stmt) }
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let file = columnText(stmt, 0) { referenced.insert(file) }
+                }
+            }
+
+            var removed = 0
+            for file in try FileManager.default.contentsOfDirectory(atPath: directory.path) {
+                guard Store.isWriterImageName(file), !referenced.contains(file) else { continue }
+                var info = stat()
+                guard fstatat(directoryFD, file, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                      info.st_mode & S_IFMT == S_IFREG,
+                      now.timeIntervalSince1970 - TimeInterval(info.st_mtimespec.tv_sec) >= minimumAge
+                else { continue }
+                if unlinkat(directoryFD, file, 0) == 0 || errno == ENOENT {
+                    removed += 1
+                } else {
+                    let message = String(cString: strerror(errno))
+                    throw StoreError.imageDelete("\(file): \(message)")
+                }
+            }
+            return removed
+        }
     }
 
     /// Drops Captures that fall outside the retention window — older than
@@ -613,12 +748,14 @@ public final class Store {
 
     private func eraseCaptureRows(_ victims: [Int64: String]) throws {
         guard !victims.isEmpty else { return }
+        var cleanupFailures: [String] = []
 
-        // Treat each Capture as a cleanup unit. A refused filesystem deletion
-        // rolls its row back, while earlier completed units stay deleted and
-        // later ones remain untouched for a safe retry.
+        // Commit the row deletion before unlinking its PNG. A database failure
+        // therefore leaves a complete Capture, while a filesystem failure can
+        // leave only an orphaned file and never a restored row with no image.
         for (id, file) in victims.sorted(by: { $0.key < $1.key }) {
             try exec("BEGIN IMMEDIATE;")
+            var committed = false
             do {
                 let del = try prepare("DELETE FROM captures WHERE id = ?;")
                 sqlite3_bind_int64(del, 1, id)
@@ -626,17 +763,22 @@ public final class Store {
                 sqlite3_finalize(del)
                 guard rc == SQLITE_DONE else { throw StoreError.sql(lastErrorMessage()) }
 
+                try exec("COMMIT;")
+                committed = true
+
                 if Store.isWriterImageName(file),
                    unlinkat(directoryFD, file, 0) != 0,
                    errno != ENOENT {
                     let message = String(cString: strerror(errno))
-                    throw StoreError.imageDelete("\(file): \(message)")
+                    cleanupFailures.append("\(file): \(message)")
                 }
-                try exec("COMMIT;")
             } catch {
-                try? exec("ROLLBACK;")
+                if !committed { try? exec("ROLLBACK;") }
                 throw error
             }
+        }
+        if !cleanupFailures.isEmpty {
+            throw StoreError.imageDelete(cleanupFailures.joined(separator: "; "))
         }
     }
 
@@ -807,8 +949,21 @@ public final class Store {
     /// The Capture with `id`, or nil if it is not (or no longer) in the spool.
     /// A missing id is the ephemeral-purge case, not an error (SPE-558).
     public func capture(id: Int64) throws -> Capture? {
+        try capture(id: id, activeOnly: false)
+    }
+
+    /// The active Capture with `id`, excluding Recently Deleted records. Agent
+    /// readers use this boundary so a remembered id cannot bypass deletion.
+    public func activeCapture(id: Int64) throws -> Capture? {
+        try capture(id: id, activeOnly: true)
+    }
+
+    private func capture(id: Int64, activeOnly: Bool) throws -> Capture? {
         guard hasCapturesTable else { return nil }
-        let stmt = try prepare("SELECT \(captureColumns) FROM captures WHERE id = ?;")
+        let stateClause = activeOnly && hasLibraryColumns
+            ? " AND library_state != 'recentlyDeleted'"
+            : ""
+        let stmt = try prepare("SELECT \(captureColumns) FROM captures WHERE id = ?\(stateClause);")
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_int64(stmt, 1, id)
         switch sqlite3_step(stmt) {
@@ -859,6 +1014,98 @@ public final class Store {
             try? exec("ROLLBACK;")
             throw error
         }
+    }
+
+    /// Copies one active Capture and its image under the lifecycle lock. The
+    /// caller receives no file reference and can safely release the lock before
+    /// image processing, serialization, or network transport.
+    public func activeCaptureSnapshot(id: Int64) throws -> CaptureLookupSnapshot {
+        try withCaptureLifecycleLock(operation: LOCK_SH) {
+            try readTransaction {
+                let latestID = try latestId()
+                guard let capture = try activeCapture(id: id) else {
+                    return CaptureLookupSnapshot(latestID: latestID, capture: nil)
+                }
+                let imagePNG = try imageData(for: capture)
+                return CaptureLookupSnapshot(
+                    latestID: latestID,
+                    capture: CaptureImageSnapshot(capture: capture, imagePNG: imagePNG)
+                )
+            }
+        }
+    }
+
+    /// Copies active metadata for list and latest-candidate responses. A later
+    /// image lookup revalidates the selected row before copying its PNG.
+    public func activeCaptureListSnapshot(
+        afterId: Int64? = nil,
+        limit: Int = 1_000
+    ) throws -> CaptureListSnapshot {
+        try withCaptureLifecycleLock(operation: LOCK_SH) {
+            try readTransaction {
+                let latestID = try latestId()
+                guard limit > 0 else {
+                    return CaptureListSnapshot(latestID: latestID, captures: [])
+                }
+                if let afterId, latestID.map({ $0 <= afterId }) ?? true {
+                    return CaptureListSnapshot(latestID: latestID, captures: [])
+                }
+                let captures = try recent(limit: limit).filter { capture in
+                    afterId.map { capture.id > $0 } ?? true
+                }
+                return CaptureListSnapshot(latestID: latestID, captures: captures)
+            }
+        }
+    }
+
+    /// Atomically validates a batch as active and copies every original PNG.
+    /// Expensive rendering and ZIP creation happen later without holding the
+    /// lifecycle lock.
+    public func activeCaptureSnapshots(ids: [Int64]) throws -> [CaptureImageSnapshot] {
+        try withCaptureLifecycleLock(operation: LOCK_SH) {
+            try readTransaction {
+                try ids.map { id in
+                    guard let capture = try activeCapture(id: id) else {
+                        throw StoreError.access("Recently Deleted or missing captures cannot be exported")
+                    }
+                    return CaptureImageSnapshot(
+                        capture: capture,
+                        imagePNG: try imageData(for: capture)
+                    )
+                }
+            }
+        }
+    }
+
+    private func withCaptureWriteLock<T>(_ body: () throws -> T) throws -> T {
+        try withCaptureLifecycleLock(operation: LOCK_EX, body)
+    }
+
+    private func withCaptureLifecycleLock<T>(
+        operation: Int32,
+        _ body: () throws -> T
+    ) throws -> T {
+        let deadline = Date().addingTimeInterval(Self.captureLifecycleLockTimeout)
+        var result: Int32
+        repeat {
+            result = flock(captureLifecycleLockFD, operation | LOCK_NB)
+            if result == 0 { break }
+            if errno == EINTR { continue }
+            guard errno == EWOULDBLOCK || errno == EAGAIN else {
+                throw StoreError.access("could not lock capture lifecycle: \(Store.systemError())")
+            }
+            guard Date() < deadline else {
+                throw StoreError.access("capture lifecycle was busy for too long")
+            }
+            usleep(10_000)
+        } while true
+        guard result == 0 else {
+            throw StoreError.access("could not lock capture lifecycle: \(Store.systemError())")
+        }
+        defer {
+            while flock(captureLifecycleLockFD, LOCK_UN) != 0 && errno == EINTR {}
+        }
+        return try body()
     }
 
     /// Reads the PNG bytes for a Capture.
@@ -986,6 +1233,32 @@ public final class Store {
         guard fchmod(fd, 0o600) == 0 else {
             throw StoreError.access("could not secure \(name): \(systemError())")
         }
+    }
+
+    private static func openCaptureLifecycleLock(directoryFD: Int32) throws -> Int32 {
+        let name = ".capture-lifecycle.lock"
+        let fd = openat(
+            directoryFD,
+            name,
+            O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC,
+            0o600
+        )
+        guard fd >= 0 else {
+            throw StoreError.access("unsafe \(name): \(systemError())")
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid() else {
+            close(fd)
+            throw StoreError.access("\(name) must be a regular file owned by the current user")
+        }
+        guard fchmod(fd, 0o600) == 0 else {
+            let message = systemError()
+            close(fd)
+            throw StoreError.access("could not secure \(name): \(message)")
+        }
+        return fd
     }
 
     private func secureExistingStoreFiles() throws {

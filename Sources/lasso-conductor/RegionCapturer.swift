@@ -33,6 +33,19 @@ struct CapturedRegion {
 
 @MainActor
 enum RegionCapturer {
+    /// Display enumeration is stable across ordinary captures but can take a
+    /// noticeable slice of the post-gesture delay. Start it as capture mode
+    /// opens, then reuse it for the actual snapshot. A changed display setup is
+    /// handled by one fresh lookup below.
+    private static var cachedShareableContent: SCShareableContent?
+    private static var shareableContentTask: Task<SCShareableContent, Error>?
+
+    static func prewarm() {
+        guard cachedShareableContent == nil, shareableContentTask == nil else { return }
+        let task = Task { try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) }
+        shareableContentTask = task
+    }
+
     /// `globalRect` is in AppKit global points (bottom-left origin); `screen` is
     /// the display it was drawn on.
     static func capture(globalRect: CGRect, screen: NSScreen) async throws -> CapturedRegion {
@@ -41,9 +54,17 @@ enum RegionCapturer {
             throw ConductorError.noDisplay
         }
 
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false, onScreenWindowsOnly: true)
-        guard let scDisplay = content.displays.first(where: { $0.displayID == displayID }) else {
+        var content = try await shareableContent()
+        var scDisplay = content.displays.first(where: { $0.displayID == displayID })
+        // A monitor may have been attached after the cache was built. Refresh
+        // once rather than holding a stale display list forever.
+        if scDisplay == nil {
+            cachedShareableContent = nil
+            shareableContentTask = nil
+            content = try await shareableContent()
+            scDisplay = content.displays.first(where: { $0.displayID == displayID })
+        }
+        guard let scDisplay else {
             throw ConductorError.noDisplay
         }
 
@@ -65,6 +86,20 @@ enum RegionCapturer {
         let cropped = try crop(full, globalRect: globalRect, screen: screen, scale: scale)
         guard let png = annotatedPNG(from: cropped) else { throw ConductorError.encodeFailed }
         return CapturedRegion(png: png, regionImage: cropped)
+    }
+
+    private static func shareableContent() async throws -> SCShareableContent {
+        if let cachedShareableContent { return cachedShareableContent }
+        if let shareableContentTask {
+            let content = try await shareableContentTask.value
+            cachedShareableContent = content
+            self.shareableContentTask = nil
+            return content
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+        cachedShareableContent = content
+        return content
     }
 
     /// Converts the selection from global points to top-left device pixels within

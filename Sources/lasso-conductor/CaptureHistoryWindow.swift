@@ -1,5 +1,6 @@
 #if os(macOS)
 import AppKit
+import ImageIO
 import LassoCore
 import LassoConductorCore
 
@@ -9,7 +10,8 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
     private enum ExportAction { case save, share }
     private struct Item {
         let capture: Capture
-        let image: NSImage
+        let thumbnail: NSImage
+        let imageAvailable: Bool
     }
     private struct DayGroup {
         let date: Date
@@ -25,11 +27,24 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
     private var searchField: NSSearchField?
     private var shareButton: LassoButton?
     private var exportButton: LassoButton?
+    private var emptyStateView: HistoryEmptyStateView?
+    private var pendingZoomSide: Double?
+    private var zoomUpdateScheduled = false
     private var dayGroups: [DayGroup] = []
+    private let shareCoordinator = CaptureShareCoordinator()
+    private let thumbnailCache = CaptureThumbnailCache()
     private let detail: CaptureDetailController
+    private let openSettings: () -> Void
+    private let openExtensionSetup: () -> Void
+    private let startCapture: () -> Void
 
-    init(detail: CaptureDetailController) {
+    init(detail: CaptureDetailController, openSettings: @escaping () -> Void = {},
+         openExtensionSetup: @escaping () -> Void = {},
+         startCapture: @escaping () -> Void = {}) {
         self.detail = detail
+        self.openSettings = openSettings
+        self.openExtensionSetup = openExtensionSetup
+        self.startCapture = startCapture
         super.init()
     }
 
@@ -59,6 +74,7 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         do {
             let store = try Store(directory: Store.defaultDirectory(), access: .reader)
             let availableTags = try store.activeTags()
+            try refreshStatePopup(store: store)
             if let tagPopup {
                 let previous = tagPopup.titleOfSelectedItem
                 tagPopup.removeAllItems()
@@ -66,18 +82,29 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
                 if let previous, tagPopup.itemTitles.contains(previous) { tagPopup.selectItem(withTitle: previous) }
             }
             let captures = try store.searchCaptures(query: searchField?.stringValue ?? "", state: selectedState, tag: selectedTag)
-            let items: [Item] = try captures.compactMap { capture in
-                guard let image = NSImage(data: try store.imageData(for: capture)) else { return nil }
-                return Item(capture: capture, image: image)
+            let loaded = CaptureHistoryLoading.resolved(captures) { capture in
+                try thumbnailCache.image(
+                    for: capture,
+                    loadData: { try store.imageData(for: capture) }
+                )
+            }
+            let items = loaded.map { result in
+                Item(
+                    capture: result.capture,
+                    thumbnail: result.value ?? CaptureImagePlaceholder.make(),
+                    imageAvailable: result.value != nil
+                )
             }
             let byID = Dictionary(uniqueKeysWithValues: items.map { ($0.capture.id, $0) })
             dayGroups = CaptureDayGrouping.grouped(captures).map { group in
                 DayGroup(date: group.day, items: group.captureIDs.compactMap { byID[$0] })
             }
-            countLabel?.stringValue = countDescription(items.count)
+            let unavailable = items.filter { !$0.imageAvailable }.count
+            countLabel?.stringValue = countDescription(items.count, unavailable: unavailable)
             collection?.reloadData()
             collection?.selectionIndexPaths = []
             updateActionButtons()
+            updateEmptyState()
             applyZoom()
         } catch {
             let alert = NSAlert(error: error)
@@ -122,6 +149,7 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         tagPopup = tag
         let search = NSSearchField()
         search.placeholderString = "Search captures"
+        search.sendsSearchStringImmediately = true
         search.target = self
         search.action = #selector(changeFilter)
         search.translatesAutoresizingMaskIntoConstraints = false
@@ -132,24 +160,32 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         slider.translatesAutoresizingMaskIntoConstraints = false
         slider.widthAnchor.constraint(equalToConstant: 120).isActive = true
         zoomSlider = slider
-        let close = LassoButton("Close", kind: .plain) { [weak self] in self?.window?.close() }
-        let share = LassoButton("Share", kind: .secondary) { [weak self] in self?.exportSelection(.share) }
+        let share = LassoButton("", symbolName: "square.and.arrow.up", accessibilityLabel: "Share selected captures",
+                                kind: .secondary) { [weak self] in self?.exportSelection(.share) }
         let export = LassoButton("Export", kind: .primary) { [weak self] in self?.exportSelection(.save) }
+        let extensionSetup = LassoButton("", symbolName: "puzzlepiece.extension", accessibilityLabel: "Set up browser extension",
+                                         kind: .plain) { [weak self] in self?.openExtensionSetup() }
+        let settings = LassoButton("", symbolName: "gearshape", accessibilityLabel: "Open settings",
+                                   kind: .plain) { [weak self] in self?.openSettings() }
         shareButton = share
         exportButton = export
         let headerSpacer = NSView()
         headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let header = stack([titleStack, headerSpacer, state, tag, search, zoomOut, slider, zoomIn, share, export, close], orientation: .horizontal, spacing: Glass.Space.sm)
+        // The system titlebar already owns closing. Keeping navigation actions
+        // here lets Settings remain the top-right control without crowding the
+        // library tools.
+        let header = stack([titleStack, headerSpacer, state, tag, search, zoomOut, slider, zoomIn, share, export, extensionSetup, settings], orientation: .horizontal, spacing: Glass.Space.sm)
         header.alignment = .centerY
 
         let layout = NSCollectionViewFlowLayout()
         layout.minimumInteritemSpacing = Glass.Space.sm
         layout.minimumLineSpacing = Glass.Space.sm
         layout.headerReferenceSize = NSSize(width: 1, height: 28)
-        let collection = NSCollectionView()
+        let collection = HistoryCollectionView()
         collection.collectionViewLayout = layout
         collection.backgroundColors = [.clear]
         collection.isSelectable = true
+        collection.allowsEmptySelection = true
         collection.allowsMultipleSelection = true
         collection.delegate = self
         collection.dataSource = self
@@ -158,6 +194,7 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
                             forSupplementaryViewOfKind: NSCollectionView.elementKindSectionHeader,
                             withIdentifier: CaptureDayHeader.identifier)
         self.collection = collection
+        collection.onActivateSelection = { [weak self] in self?.openSelectedCapture() }
 
         let scroll = NSScrollView()
         scroll.drawsBackground = false
@@ -168,11 +205,20 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         let gridCard = GlassCard()
         gridCard.translatesAutoresizingMaskIntoConstraints = false
         gridCard.contentView.addSubview(scroll)
+        let emptyState = HistoryEmptyStateView()
+        emptyState.isHidden = true
+        emptyStateView = emptyState
+        gridCard.contentView.addSubview(emptyState)
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: gridCard.contentView.topAnchor, constant: Glass.Space.sm),
             scroll.bottomAnchor.constraint(equalTo: gridCard.contentView.bottomAnchor, constant: -Glass.Space.sm),
             scroll.leadingAnchor.constraint(equalTo: gridCard.contentView.leadingAnchor, constant: Glass.Space.sm),
             scroll.trailingAnchor.constraint(equalTo: gridCard.contentView.trailingAnchor, constant: -Glass.Space.sm),
+            emptyState.centerXAnchor.constraint(equalTo: gridCard.contentView.centerXAnchor),
+            emptyState.centerYAnchor.constraint(equalTo: gridCard.contentView.centerYAnchor),
+            emptyState.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
+            emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: gridCard.contentView.leadingAnchor, constant: Glass.Space.lg),
+            emptyState.trailingAnchor.constraint(lessThanOrEqualTo: gridCard.contentView.trailingAnchor, constant: -Glass.Space.lg),
         ])
 
         let root = stack([header, gridCard], orientation: .vertical, spacing: Glass.Space.md)
@@ -189,15 +235,88 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         ])
     }
 
-    @objc private func changeZoom() { applyZoom() }
+    @objc private func changeZoom() {
+        pendingZoomSide = zoomSlider?.doubleValue
+        scheduleZoomUpdate()
+    }
     @objc private func changeFilter() { reload() }
 
-    private func applyZoom() {
+    private func updateEmptyState() {
+        guard let emptyStateView else { return }
+        let hasCaptures = dayGroups.contains { !$0.items.isEmpty }
+        emptyStateView.isHidden = hasCaptures
+        guard !hasCaptures else { return }
+
+        let hasQuery = !(searchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let hasFilter = (statePopup?.indexOfSelectedItem ?? 0) > 0 || selectedTag != nil
+        if hasQuery || hasFilter {
+            emptyStateView.configure(
+                symbolName: "line.3.horizontal.decrease.circle",
+                title: "No matching captures",
+                detail: "Try another search, tag, or library filter.",
+                actionTitle: "Clear filters"
+            ) { [weak self] in self?.clearFilters() }
+        } else {
+            emptyStateView.configure(
+                symbolName: "viewfinder",
+                title: "No captures yet",
+                detail: "Capture a region and it will appear here with its pins, notes, and context.",
+                actionTitle: "Capture a region"
+            ) { [weak self] in
+                self?.window?.orderOut(nil)
+                self?.startCapture()
+            }
+        }
+    }
+
+    private func clearFilters() {
+        searchField?.stringValue = ""
+        statePopup?.selectItem(at: 0)
+        tagPopup?.selectItem(at: 0)
+        reload()
+    }
+
+    private func refreshStatePopup(store: Store) throws {
+        guard let statePopup else { return }
+        let selectedIndex = max(0, statePopup.indexOfSelectedItem)
+        let recent = try store.count(in: .recent)
+        let kept = try store.count(in: .kept)
+        let deleted = try store.count(in: .recentlyDeleted)
+        let all = recent + kept
+        statePopup.removeAllItems()
+        statePopup.addItems(withTitles: [
+            "All active (\(all))",
+            "Recents (\(recent))",
+            "Kept (\(kept))",
+            "Recently Deleted (\(deleted))",
+        ])
+        statePopup.selectItem(at: selectedIndex)
+    }
+
+    private func scheduleZoomUpdate() {
+        guard !zoomUpdateScheduled else { return }
+        zoomUpdateScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
+            guard let self else { return }
+            self.zoomUpdateScheduled = false
+            let side = self.pendingZoomSide
+            self.pendingZoomSide = nil
+            self.applyZoom(side: side)
+        }
+    }
+
+    private func applyZoom(side requestedSide: Double? = nil) {
         guard let layout = collection?.collectionViewLayout as? NSCollectionViewFlowLayout,
-              let side = zoomSlider?.doubleValue else { return }
+              let sliderSide = zoomSlider?.doubleValue else { return }
         // The slider changes tile density rather than scaling the screenshot
         // pixels independently, matching the familiar Photos grid interaction.
-        layout.itemSize = NSSize(width: side, height: side * 0.76)
+        // Coalescing continuous slider events to the display cadence and using
+        // whole-point sizes avoids repeated full layout passes that cannot be
+        // presented between frames.
+        let side = (requestedSide ?? sliderSide).rounded()
+        let size = NSSize(width: side, height: (side * 0.76).rounded())
+        guard layout.itemSize != size else { return }
+        layout.itemSize = size
         layout.invalidateLayout()
     }
 
@@ -212,7 +331,11 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         let item = collectionView.makeItem(withIdentifier: CaptureThumbnailItem.identifier, for: indexPath)
         guard let tile = item as? CaptureThumbnailItem else { return item }
         let entry = dayGroups[indexPath.section].items[indexPath.item]
-        tile.configure(capture: entry.capture, image: entry.image) { [weak self, weak collectionView] modifiers, clickCount in
+        tile.configure(
+            capture: entry.capture,
+            image: entry.thumbnail,
+            imageAvailable: entry.imageAvailable
+        ) { [weak self, weak collectionView] modifiers, clickCount in
             self?.handleClick(at: indexPath, modifiers: modifiers, clickCount: clickCount, collection: collectionView)
         }
         return tile
@@ -228,9 +351,8 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
             clickCount: clickCount
         )
         collection.selectionIndexPaths = result.selection
-        refreshSelectionAppearance(in: collection)
+        selectionDidChange(in: collection)
         collection.window?.makeFirstResponder(collection)
-        updateActionButtons()
         guard let openItem = result.openItem else { return }
         let ids = dayGroups.map { $0.items.map { $0.capture.id } }
         guard let captureID = CaptureHistoryOpening.captureID(at: openItem, dayGroups: ids) else { return }
@@ -241,8 +363,31 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         let enabled = collection?.selectionIndexPaths.isEmpty == false
         for button in [shareButton, exportButton].compactMap({ $0 }) {
             button.isEnabled = enabled
-            button.alphaValue = enabled ? 1 : 0.45
         }
+    }
+
+    func collectionView(_ collectionView: NSCollectionView,
+                        didSelectItemsAt indexPaths: Set<IndexPath>) {
+        selectionDidChange(in: collectionView)
+    }
+
+    func collectionView(_ collectionView: NSCollectionView,
+                        didDeselectItemsAt indexPaths: Set<IndexPath>) {
+        selectionDidChange(in: collectionView)
+    }
+
+    private func selectionDidChange(in collection: NSCollectionView) {
+        refreshSelectionAppearance(in: collection)
+        updateActionButtons()
+    }
+
+    private func openSelectedCapture() {
+        guard let indexPath = collection?.selectionIndexPaths.sorted(by: {
+            ($0.section, $0.item) < ($1.section, $1.item)
+        }).first,
+              indexPath.section < dayGroups.count,
+              indexPath.item < dayGroups[indexPath.section].items.count else { return }
+        detail.show(captureID: dayGroups[indexPath.section].items[indexPath.item].capture.id)
     }
 
     private func refreshSelectionAppearance(in collection: NSCollectionView) {
@@ -260,18 +405,26 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
 
     private func exportSelection(_ action: ExportAction) {
         guard let collection else { return }
-        let selected = collection.selectionIndexPaths.compactMap { indexPath -> CaptureExporter.Item? in
+        let selectedCaptures = collection.selectionIndexPaths.sorted(by: {
+            ($0.section, $0.item) < ($1.section, $1.item)
+        }).compactMap { indexPath -> Capture? in
             guard indexPath.section < dayGroups.count, indexPath.item < dayGroups[indexPath.section].items.count else { return nil }
-            let item = dayGroups[indexPath.section].items[indexPath.item]
-            return CaptureExporter.Item(capture: item.capture, image: item.image)
+            return dayGroups[indexPath.section].items[indexPath.item].capture
         }
-        guard !selected.isEmpty else {
+        guard !selectedCaptures.isEmpty else {
             let alert = NSAlert(); alert.messageText = "Select one or more captures first"; alert.runModal(); return
         }
         do {
+            let store = try Store(directory: Store.defaultDirectory(), access: .reader)
+            let selected: [CaptureExporter.Item] = try selectedCaptures.map { capture in
+                guard let image = NSImage(data: try store.imageData(for: capture)) else {
+                    throw StoreError.imageRead("capture \(capture.id) image could not be decoded")
+                }
+                return CaptureExporter.Item(capture: capture, image: image)
+            }
             let destination: URL
             if action == .share {
-                destination = FileManager.default.temporaryDirectory
+                destination = try TemporaryArtifactLease.shareDirectory()
             } else {
                 let panel = NSOpenPanel()
                 panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.canCreateDirectories = true
@@ -279,11 +432,9 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
                 guard panel.runModal() == .OK, let url = panel.url else { return }
                 destination = url
             }
-            let store = try Store(directory: Store.defaultDirectory(), access: .reader)
             let zip = try CaptureExporter.export(items: selected, store: store, to: destination)
             if action == .share {
-                let picker = NSSharingServicePicker(items: [zip])
-                picker.show(relativeTo: collection.bounds, of: collection, preferredEdge: .maxY)
+                shareCoordinator.present(archive: zip, relativeTo: collection.bounds, of: collection)
             } else {
                 NSWorkspace.shared.activateFileViewerSelecting([zip])
             }
@@ -292,8 +443,11 @@ final class CaptureHistoryController: NSObject, NSCollectionViewDataSource, NSCo
         }
     }
 
-    private func countDescription(_ count: Int) -> String {
-        count == 1 ? "1 capture" : "\(count) captures"
+    private func countDescription(_ count: Int, unavailable: Int = 0) -> String {
+        let captures = count == 1 ? "1 capture" : "\(count) captures"
+        guard unavailable > 0 else { return captures }
+        let images = unavailable == 1 ? "1 image unavailable" : "\(unavailable) images unavailable"
+        return "\(captures) · \(images)"
     }
 
     private func label(_ string: String, font: NSFont, color: NSColor) -> NSTextField {
@@ -333,8 +487,7 @@ private final class CaptureDayHeader: NSView {
     required init?(coder: NSCoder) { fatalError("unused") }
 
     func configure(date: Date) {
-        let formatter = DateFormatter(); formatter.dateStyle = .full; formatter.timeStyle = .none
-        label.stringValue = formatter.string(from: date)
+        label.stringValue = CaptureDisplayDate.dayHeader(date)
     }
 }
 
@@ -347,12 +500,12 @@ private final class CaptureThumbnailItem: NSCollectionViewItem {
         didSet { (view as? CaptureThumbnailView)?.selected = isSelected }
     }
 
-    func configure(capture: Capture, image: NSImage,
+    func configure(capture: Capture, image: NSImage, imageAvailable: Bool,
                    onClick: @escaping (NSEvent.ModifierFlags, Int) -> Void) {
         guard let thumbnail = view as? CaptureThumbnailView else { return }
         thumbnail.onClick = onClick
         thumbnail.selected = isSelected
-        thumbnail.configure(capture: capture, image: image)
+        thumbnail.configure(capture: capture, image: image, imageAvailable: imageAvailable)
     }
 }
 
@@ -360,16 +513,56 @@ private final class CaptureThumbnailView: CaptureGridItemView {
     private var image: NSImage?
     private var pinCount = 0
     private var label = ""
-    var selected = false { didSet { needsDisplay = true } }
+    private let selectionBadge = NSImageView()
+    var selected = false {
+        didSet {
+            selectionBadge.isHidden = !selected
+            setAccessibilityValue(selected ? "Selected" : "Not selected")
+            needsDisplay = true
+        }
+    }
 
-    func configure(capture: Capture, image: NSImage) {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityHelp("Select this capture. Press Return to open it.")
+
+        selectionBadge.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .bold))
+        selectionBadge.contentTintColor = Glass.amberInk
+        selectionBadge.imageScaling = .scaleProportionallyDown
+        selectionBadge.wantsLayer = true
+        selectionBadge.layer?.cornerRadius = 12
+        selectionBadge.layer?.backgroundColor = Glass.amberHi.cgColor
+        selectionBadge.layer?.borderWidth = 1
+        selectionBadge.layer?.borderColor = NSColor.white.withAlphaComponent(0.55).cgColor
+        selectionBadge.isHidden = true
+        selectionBadge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(selectionBadge)
+        NSLayoutConstraint.activate([
+            selectionBadge.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            selectionBadge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            selectionBadge.widthAnchor.constraint(equalToConstant: 24),
+            selectionBadge.heightAnchor.constraint(equalToConstant: 24),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    func configure(capture: Capture, image: NSImage, imageAvailable: Bool) {
         self.image = image
         pinCount = capture.markers.count
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        label = formatter.string(from: capture.createdAt)
+        label = CaptureDisplayDate.thumbnail(capture.createdAt)
+        let pins = pinCount == 1 ? "1 pin" : "\(pinCount) pins"
+        let availability = imageAvailable ? "" : ", image unavailable"
+        setAccessibilityLabel("Capture \(capture.id), \(label), \(pins)\(availability)")
         needsDisplay = true
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onClick?([], 2)
+        return true
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -384,7 +577,17 @@ private final class CaptureThumbnailView: CaptureGridItemView {
         let captionHeight: CGFloat = 22
         let frame = NSRect(x: imageArea.minX, y: imageArea.minY + captionHeight,
                            width: imageArea.width, height: imageArea.height - captionHeight)
-        if let image { image.draw(in: aspectFit(image.size, in: frame), from: .zero, operation: .sourceOver, fraction: 1) }
+        if let image {
+            let imageRect = aspectFit(image.size, in: frame)
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(
+                roundedRect: imageRect,
+                xRadius: Glass.Radius.sm - 4,
+                yRadius: Glass.Radius.sm - 4
+            ).addClip()
+            image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1)
+            NSGraphicsContext.restoreGraphicsState()
+        }
         let text = label as NSString
         text.draw(at: CGPoint(x: imageArea.minX + 2, y: imageArea.minY + 2), withAttributes: [
             .font: Glass.Font.caption(), .foregroundColor: Glass.muted,
@@ -407,6 +610,104 @@ private final class CaptureThumbnailView: CaptureGridItemView {
         let fitted = NSSize(width: size.width * scale, height: size.height * scale)
         return NSRect(x: rect.midX - fitted.width / 2, y: rect.midY - fitted.height / 2,
                       width: fitted.width, height: fitted.height)
+    }
+}
+
+private final class HistoryCollectionView: NSCollectionView {
+    var onActivateSelection: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 || event.keyCode == 76 {
+            onActivateSelection?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+private final class HistoryEmptyStateView: NSView {
+    private let icon = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(wrappingLabelWithString: "")
+    private var actionButton: LassoButton?
+    private var action: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        setAccessibilityElement(true)
+
+        icon.contentTintColor = Glass.amberHi
+        icon.imageScaling = .scaleProportionallyDown
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = Glass.Font.heading()
+        titleLabel.textColor = Glass.ink
+        titleLabel.alignment = .center
+        detailLabel.font = Glass.Font.body()
+        detailLabel.textColor = Glass.muted
+        detailLabel.alignment = .center
+        detailLabel.maximumNumberOfLines = 0
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let button = LassoButton("", kind: .primary) { [weak self] in self?.action?() }
+        actionButton = button
+        let stack = NSStackView(views: [icon, titleLabel, detailLabel, button])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = Glass.Space.sm
+        stack.setCustomSpacing(Glass.Space.md, after: detailLabel)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 40),
+            icon.heightAnchor.constraint(equalToConstant: 40),
+            detailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+
+    func configure(symbolName: String, title: String, detail: String,
+                   actionTitle: String, action: @escaping () -> Void) {
+        icon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 32, weight: .regular))
+        titleLabel.stringValue = title
+        detailLabel.stringValue = detail
+        actionButton?.title = actionTitle
+        actionButton?.setAccessibilityLabel(actionTitle)
+        self.action = action
+        setAccessibilityLabel("\(title). \(detail)")
+    }
+}
+
+private final class CaptureThumbnailCache {
+    private let cache = NSCache<NSString, NSImage>()
+
+    init() {
+        cache.countLimit = 100
+        cache.totalCostLimit = 48 * 1_024 * 1_024
+    }
+
+    func image(for capture: Capture, loadData: () throws -> Data) rethrows -> NSImage? {
+        let key = capture.imageFile as NSString
+        if let cached = cache.object(forKey: key) { return cached }
+        let data = try loadData()
+        guard let source = CGImageSourceCreateWithData(data as CFData, [
+            kCGImageSourceShouldCache: false,
+        ] as CFDictionary),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 640,
+                kCGImageSourceShouldCacheImmediately: true,
+              ] as CFDictionary) else { return nil }
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+        cache.setObject(image, forKey: key, cost: cgImage.bytesPerRow * cgImage.height)
+        return image
     }
 }
 #endif

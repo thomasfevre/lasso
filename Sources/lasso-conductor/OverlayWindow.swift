@@ -10,6 +10,7 @@ final class OverlayController {
     private var completion: ((CGRect?) -> Void)?
     private var startPoint: CGPoint?
     private var currentRect: CGRect?
+    private var isFinishing = false
 
     init(screens: [NSScreen]) {
         self.screens = screens
@@ -62,7 +63,20 @@ final class OverlayController {
 
     private func finishGesture(at point: CGPoint) {
         updateGesture(to: point)
-        finish(currentRect)
+        guard let rect = currentRect, rect.width > 3, rect.height > 3 else {
+            finish(currentRect)
+            return
+        }
+        // A brief locked-in border answers the user's mouse-up on the same
+        // surface they just manipulated. It is deliberately shorter than a
+        // frame of perceived latency, then the overlay disappears before the
+        // ScreenCaptureKit snapshot so it can never leak into the capture.
+        guard !isFinishing else { return }
+        isFinishing = true
+        windows.forEach { $0.selectionView.confirmSelection() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) { [weak self] in
+            self?.finish(rect)
+        }
     }
 
     private func render(_ globalRect: CGRect?) {
@@ -80,6 +94,7 @@ final class OverlayController {
         guard completion != nil else { return }
         startPoint = nil
         currentRect = nil
+        isFinishing = false
         windows.forEach { $0.orderOut(nil) }
         windows = []
         let done = completion
@@ -124,6 +139,7 @@ final class SelectionView: NSView {
     /// starts so it never sits under the selection.
     private let hint: NSView = SelectionView.makeHint()
     private var hintDismissed = false
+    private var selectionCommitted = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -144,6 +160,14 @@ final class SelectionView: NSView {
         guard !hintDismissed else { return }
         hintDismissed = true
         hint.isHidden = true
+    }
+
+    /// Freezes the completed selection for one tactile beat before the overlay
+    /// leaves. The next visible state is the annotation panel, so this gives the
+    /// release gesture a clear causal acknowledgement without an extra modal.
+    func confirmSelection() {
+        selectionCommitted = true
+        needsDisplay = true
     }
 
     private static func makeHint() -> NSView {
@@ -195,9 +219,9 @@ final class SelectionView: NSView {
         NSColor.clear.setFill()
         rect.fill(using: .copy)
 
-        NSColor.systemRed.setStroke()
+        (selectionCommitted ? NSColor.systemOrange : NSColor.systemRed).setStroke()
         let path = NSBezierPath(rect: rect)
-        path.lineWidth = 2
+        path.lineWidth = selectionCommitted ? 2.5 : 2
         path.stroke()
     }
 

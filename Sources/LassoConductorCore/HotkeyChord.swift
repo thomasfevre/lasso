@@ -59,10 +59,11 @@ public struct HotkeyChord: Sendable, Equatable, CustomStringConvertible {
         self.modifiers = modifiers
     }
 
-    /// Option-Space: a two-key default that is quick to hit one-handed.
+    /// Control-Option-Space avoids Finder's Option-Space Quick Look shortcut
+    /// while remaining easy to trigger with one hand.
     public static let defaultCapture = HotkeyChord(
         keyCode: 49,
-        modifiers: [.option])
+        modifiers: [.control, .option])
 
     public var validationError: HotkeyValidationError? {
         guard let keyCode else { return .missingKey }
@@ -81,6 +82,12 @@ public struct HotkeyChord: Sendable, Equatable, CustomStringConvertible {
             return .systemReserved(description)
         }
         if keyCode == 49, modifiers == [.command] {
+            return .systemReserved(description)
+        }
+        // Finder uses Option-Space for Quick Look. Carbon registration can appear
+        // to succeed, but Finder wins the event and Lasso never enters capture
+        // mode, which makes the shortcut feel flaky rather than unavailable.
+        if keyCode == 49, modifiers == [.option] {
             return .systemReserved(description)
         }
         return nil

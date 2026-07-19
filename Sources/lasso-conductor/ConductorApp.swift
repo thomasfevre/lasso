@@ -1,6 +1,7 @@
 #if os(macOS)
 import AppKit
 import UserNotifications
+import os
 import LassoCore
 import LassoConductorCore
 
@@ -9,7 +10,9 @@ import LassoConductorCore
 /// one at a time.
 final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private var hotkey: GlobalHotkey?
+    private var hotkeyLifecycle = HotkeyRegistrationLifecycle(hasRegistration: false)
     private var activeHotkey = HotkeyChord.defaultCapture
+    private var pendingHotkey: HotkeyChord?
     private var statusItem: NSStatusItem?
     private var overlay: OverlayController?
     private var isCapturing = false
@@ -36,6 +39,13 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
     /// symbol + bitmap every tick when nothing changed.
     private var cachedIconKey: String?
     private var cachedIcon: NSImage?
+    /// Delayed so fast captures never flash a busy indicator, but a slower
+    /// ScreenCaptureKit or OCR pass still has a visible, calm progress state.
+    private var captureFeedbackWorkItem: DispatchWorkItem?
+    private var captureFeedbackTimer: Timer?
+    private var isPreparingCapture = false
+    private var preparingPulseOn = false
+    private let captureLatencyLog = Logger(subsystem: "xyz.allez.lasso", category: "capture.latency")
 
     // Menu items kept for live updates (SPE-556 feedback / SPE-557 clipboard).
     private var captureItem: NSMenuItem?
@@ -51,16 +61,22 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
     /// Tooltip to restore after a pending-request nudge is dismissed, expires,
     /// or is fulfilled.
     private var normalStatusTitle = "Lasso"
+    /// The idle menu header. A transient preparation label must not remain after
+    /// the annotation panel has appeared.
+    private var lastCaptureSummary = "No captures yet"
 
     /// Point size of the menu-bar viewfinder glyph — matched to standard menu-bar
     /// icons (a text glyph rendered visibly smaller than its neighbors).
     private static let iconPointSize: CGFloat = 15
+    private static let captureFeedbackDelay: TimeInterval = 0.15
+    private static let captureFeedbackPulseInterval: TimeInterval = 0.18
 
     /// Builds the menu-bar icon: a `viewfinder` symbol tinted for the menu bar's
     /// appearance, dimmed when Screen Recording is missing, and badged with a red
     /// dot when an agent has a pending capture request. Recomputed on each status
     /// refresh so it tracks light/dark changes.
-    private func statusImage(pending: Bool, blocked: Bool, appearance: NSAppearance?) -> NSImage {
+    private func statusImage(pending: Bool, blocked: Bool, preparing: Bool, pulseOn: Bool,
+                             appearance: NSAppearance?) -> NSImage {
         let config = NSImage.SymbolConfiguration(pointSize: Self.iconPointSize, weight: .regular)
         let glyph = NSImage(systemSymbolName: "viewfinder", accessibilityDescription: "Lasso")?
             .withSymbolConfiguration(config)
@@ -74,6 +90,13 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             glyph?.draw(in: box)
             ink.set()
             box.fill(using: .sourceAtop) // tint the template glyph
+            if preparing {
+                let diameter: CGFloat = pulseOn ? 5.5 : 4
+                let pulse = NSRect(x: rect.midX - diameter / 2, y: rect.midY - diameter / 2,
+                                   width: diameter, height: diameter)
+                Glass.amberHi.withAlphaComponent(pulseOn ? 1 : 0.62).setFill()
+                NSBezierPath(ovalIn: pulse).fill()
+            }
             if pending {
                 let d: CGFloat = 7
                 NSColor.systemRed.setFill()
@@ -91,6 +114,17 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         setupRequestNudge()
         setupNotifications()
         activateInitialHotkey()
+
+        do {
+            let store = try Store(
+                directory: Store.defaultDirectory(),
+                retention: LibraryPreferences.retention
+            )
+            try LibraryStartupMaintenance.run(store: store)
+        } catch {
+            FileHandle.standardError.write(Data(
+                "lasso: could not apply library retention at launch: \(error)\n".utf8))
+        }
 
         do {
             try NativeMessagingHostInstaller.install()
@@ -127,7 +161,7 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
 
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = statusImage(pending: false, blocked: false,
+        item.button?.image = statusImage(pending: false, blocked: false, preparing: false, pulseOn: false,
                                          appearance: item.button?.effectiveAppearance)
         let menu = NSMenu()
         menu.delegate = self // refresh permission-dependent state on open
@@ -177,11 +211,11 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         menu.addItem(showLastCapture)
         showLastCaptureItem = showLastCapture
 
-        let history = NSMenuItem(title: "History…", action: #selector(showCaptureHistory), keyEquivalent: "")
+        let history = NSMenuItem(title: "History", action: #selector(showCaptureHistory), keyEquivalent: "")
         history.target = self
         menu.addItem(history)
 
-        let settings = NSMenuItem(title: "Settings…", action: #selector(showLibrarySettings), keyEquivalent: ",")
+        let settings = NSMenuItem(title: "Settings", action: #selector(showLibrarySettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
 
@@ -194,23 +228,23 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         menu.addItem(copyRef)
         copyRefItem = copyRef
         menu.addItem(.separator())
-        let permItem = NSMenuItem(title: "Screen Recording permission…",
+        let permItem = NSMenuItem(title: "Screen Recording Permission",
                                   action: #selector(openScreenRecordingSettings), keyEquivalent: "")
         permItem.target = self
         menu.addItem(permItem)
-        let axItem = NSMenuItem(title: "Accessibility permission…",
+        let axItem = NSMenuItem(title: "Accessibility Permission",
                                 action: #selector(openAccessibilitySettings), keyEquivalent: "")
         axItem.target = self
         menu.addItem(axItem)
-        let setupItem = NSMenuItem(title: "Setup…", action: #selector(openSetup), keyEquivalent: "")
+        let setupItem = NSMenuItem(title: "Set Up Lasso", action: #selector(openSetup), keyEquivalent: "")
         setupItem.target = self
         menu.addItem(setupItem)
         menu.addItem(.separator())
-        let relayStatus = NSMenuItem(title: "Browser relay starting…", action: nil, keyEquivalent: "")
+        let relayStatus = NSMenuItem(title: "Browser relay starting", action: nil, keyEquivalent: "")
         relayStatus.isEnabled = false
         menu.addItem(relayStatus)
         relayStatusItem = relayStatus
-        let revokeRelay = NSMenuItem(title: "Revoke all browser pairings…",
+        let revokeRelay = NSMenuItem(title: "Revoke all browser pairings",
                                      action: #selector(revokeAllRelayPairings), keyEquivalent: "")
         revokeRelay.target = self
         menu.addItem(revokeRelay)
@@ -433,7 +467,11 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
     @objc private func showCaptureHistory() {
         let detail = captureDetail ?? CaptureDetailController()
         captureDetail = detail
-        let history = captureHistory ?? CaptureHistoryController(detail: detail)
+        let history = captureHistory ?? CaptureHistoryController(
+            detail: detail,
+            openSettings: { [weak self] in self?.showLibrarySettings() },
+            openExtensionSetup: { [weak self] in self?.showBrowserExtensionSetup() },
+            startCapture: { [weak self] in self?.startCapture() })
         captureHistory = history
         history.show()
     }
@@ -441,7 +479,11 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
     @objc private func showLibrarySettings() {
         let settings = librarySettings ?? LibrarySettingsController(
             activeHotkey: { [weak self] in self?.activeHotkey ?? .defaultCapture },
-            updateHotkey: { [weak self] chord in self?.updateHotkey(to: chord) ?? false })
+            updateHotkey: { [weak self] chord in self?.updateHotkey(to: chord) ?? false },
+            hotkeyEditingChanged: { [weak self] editing in self?.setHotkeyEditing(editing) },
+            openHistory: { [weak self] in self?.showCaptureHistory() },
+            openExtensionSetup: { [weak self] in self?.showBrowserExtensionSetup() },
+            didChangeStorageLocation: { [weak self] in self?.restartBrowserRelay() })
         librarySettings = settings
         settings.show()
     }
@@ -467,9 +509,36 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         let controller = onboarding ?? OnboardingController(
             relay: relay,
             activeHotkey: { [weak self] in self?.activeHotkey ?? .defaultCapture },
-            updateHotkey: { [weak self] chord in self?.updateHotkey(to: chord) ?? false })
+            updateHotkey: { [weak self] chord in self?.updateHotkey(to: chord) ?? false },
+            hotkeyEditingChanged: { [weak self] editing in self?.setHotkeyEditing(editing) })
         onboarding = controller
         controller.show()
+    }
+
+    private func showBrowserExtensionSetup() {
+        let controller = onboarding ?? OnboardingController(
+            relay: relay,
+            activeHotkey: { [weak self] in self?.activeHotkey ?? .defaultCapture },
+            updateHotkey: { [weak self] chord in self?.updateHotkey(to: chord) ?? false },
+            hotkeyEditingChanged: { [weak self] editing in self?.setHotkeyEditing(editing) })
+        onboarding = controller
+        controller.showExtensionSetup()
+    }
+
+    private func restartBrowserRelay() {
+        do {
+            requestStore = try Store(directory: Store.defaultDirectory(), access: .requestWriter)
+            refreshPendingRequest()
+        } catch {
+            requestStore = nil
+            FileHandle.standardError.write(Data(
+                "lasso: could not reopen request channel after moving library: \(error)\n".utf8))
+        }
+        relay?.stop()
+        let server = RelayServer(storeDirectory: Store.defaultDirectory())
+        server.start()
+        relay = server
+        onboarding?.updateRelay(server)
     }
 
     // MARK: - Capture hotkey
@@ -485,7 +554,7 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             }
             do {
                 try installHotkey(.defaultCapture)
-                setStatus(title: "Lasso — saved hotkey unavailable; using \(activeHotkey.description)")
+                setStatus(title: "Lasso: saved hotkey unavailable; using \(activeHotkey.description)")
             } catch {
                 setStatus(title: "Lasso (hotkey unavailable)")
             }
@@ -499,6 +568,7 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             self?.startCapture()
         }
         hotkey = replacement
+        hotkeyLifecycle.didInstall()
         activeHotkey = chord
         refreshCaptureMenuItem()
     }
@@ -508,17 +578,52 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             showHotkeyAlert(message: validationError.message)
             return false
         }
-        if chord == activeHotkey {
+        if !hotkeyLifecycle.installationAllowed {
+            // More than one recorder can be visible. Keep the candidate separate
+            // from the last known-good shortcut until macOS accepts it after the
+            // final recorder releases the keyboard.
+            pendingHotkey = chord
+            return true
+        }
+        if !hotkeyLifecycle.needsInstallation(candidate: chord, active: activeHotkey) {
+            pendingHotkey = nil
             HotkeyPreferences.save(chord)
             return true
         }
         do {
             try installHotkey(chord)
+            pendingHotkey = nil
             HotkeyPreferences.save(chord)
             return true
         } catch {
             showHotkeyAlert(message: error.localizedDescription)
             return false
+        }
+    }
+
+    /// While a recorder owns the keyboard, release the Carbon registration so
+    /// pressing the current shortcut edits the field instead of starting capture.
+    private func setHotkeyEditing(_ editing: Bool) {
+        if editing {
+            if hotkeyLifecycle.beginEditing() { hotkey = nil }
+            return
+        }
+
+        guard hotkeyLifecycle.endEditingNeedsRestore() else { return }
+        let fallback = activeHotkey
+        let candidate = pendingHotkey ?? fallback
+        do {
+            try installHotkey(candidate)
+            if pendingHotkey != nil { HotkeyPreferences.save(candidate) }
+            pendingHotkey = nil
+        } catch {
+            pendingHotkey = nil
+            do {
+                try installHotkey(fallback)
+            } catch {
+                setStatus(title: "Lasso (hotkey unavailable)")
+            }
+            showHotkeyAlert(message: error.localizedDescription)
         }
     }
 
@@ -534,7 +639,7 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
 
     private func captureMenuTitle(hasScreenRecording: Bool = true) -> String {
         let shortcut = "Capture region  (\(activeHotkey.description))"
-        return hasScreenRecording ? shortcut : "\(shortcut) — needs Screen Recording"
+        return hasScreenRecording ? shortcut : "\(shortcut): needs Screen Recording"
     }
 
     private func refreshCaptureMenuItem() {
@@ -548,6 +653,14 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         guard !isCapturing, overlay == nil else { return }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return }
+        // Start the ScreenCaptureKit display lookup while the user is drawing.
+        // The capture still uses a fresh screen image after mouse-up; only stable
+        // display metadata is being prepared ahead of time.
+        Task { @MainActor in RegionCapturer.prewarm() }
+        // The review window may still be ordered behind another app. Dismiss it
+        // before adding our capture overlay so it cannot resurface when the
+        // overlay/annotation flow completes.
+        captureDetail?.dismissForNewCapture()
         isCapturing = true
 
         let controller = OverlayController(screens: screens)
@@ -562,6 +675,8 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
                 self.isCapturing = false
                 return
             }
+            let selectionFinishedAt = Date()
+            self.beginCaptureFeedback()
             // SPE-547: route by where the user pointed. A browser Target Window
             // selects the web Provider (DOM path lands in SPE-549); until then all
             // Providers screen-capture, but a resolved Target Window clips the
@@ -579,27 +694,46 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             // dominant display's portion so the image and its global rect remain
             // aligned for context extraction and marker resolution.
             let displayRect = captureRect.intersection(screen.frame)
-            self.captureAndStore(globalRect: displayRect, screen: screen, routing: decision)
+            self.captureAndStore(globalRect: displayRect, screen: screen, routing: decision,
+                                 selectionFinishedAt: selectionFinishedAt)
         }
     }
 
-    private func captureAndStore(globalRect: CGRect, screen: NSScreen, routing: RoutingDecision) {
+    private func captureAndStore(globalRect: CGRect, screen: NSScreen, routing: RoutingDecision,
+                                 selectionFinishedAt: Date) {
         Task { @MainActor in
-            defer { isCapturing = false }
+            defer {
+                isCapturing = false
+                endCaptureFeedback()
+            }
             do {
                 let target = routing.targetWindow?.appName ?? "desktop"
                 FileHandle.standardError.write(Data(
                     "lasso: routed to \(routing.provider.rawValue) provider (target: \(target))\n".utf8))
                 let region = try await RegionCapturer.capture(globalRect: globalRect, screen: screen)
-                let regionOCR = try RegionContextExtractor.recognize(region.regionImage)
+                let imageReadyAt = Date()
+                // Vision is the expensive part of enrichment. Let it run while
+                // the user annotates rather than holding the first annotation
+                // frame hostage to two accurate OCR passes.
+                let ocrTask = Task.detached(priority: .userInitiated) {
+                    try RegionContextExtractor.recognize(region.regionImage)
+                }
+                // SPE-555: keyboard-first pin-drop annotate step (skippable).
+                let annotation = AnnotationPrompt.run(image: NSImage(data: region.png)) { [weak self] in
+                    let imageLatency = Int(imageReadyAt.timeIntervalSince(selectionFinishedAt) * 1_000)
+                    let readyLatency = Int(Date().timeIntervalSince(selectionFinishedAt) * 1_000)
+                    self?.captureLatencyLog.info(
+                        "capture ready selection_to_image_ms=\(imageLatency, privacy: .public) selection_to_annotation_ms=\(readyLatency, privacy: .public)"
+                    )
+                    self?.endCaptureFeedback()
+                }
+                let regionOCR = try await ocrTask.value
                 var context = await resolveContext(
                     routing: routing, globalRect: globalRect, ocr: regionOCR.selection)
                 // SPE-559: tell the Agent what it is looking at (best-effort; the
                 // title needs Screen Recording permission and is often absent).
                 context.appName = routing.targetWindow?.appName
                 context.windowTitle = routing.targetWindow?.windowTitle
-                // SPE-555: keyboard-first pin-drop annotate step (skippable).
-                let annotation = AnnotationPrompt.run(image: NSImage(data: region.png))
                 // SPE-560: resolve each dropped pin to its own element (DOM on web,
                 // AX/OCR on screen) so every pin is a precise anchor for the Agent.
                 let markers = await resolveMarkers(
@@ -701,7 +835,9 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
     }
 
     private func report(_ error: Error) {
-        setStatus(title: "Lasso — capture failed")
+        endCaptureFeedback()
+        setStatus(title: "Lasso: capture failed")
+        lastCaptureItem?.title = "Capture failed. Try again"
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Lasso could not capture"
@@ -723,7 +859,9 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         NSSound(named: "Pop")?.play()
 
         let noun = pins == 1 ? "pin" : "pins"
-        lastCaptureItem?.title = "Last: id \(capture.id) · \(pins) \(noun) · \(capture.context.source.rawValue)"
+        let summary = "Last: id \(capture.id) · \(pins) \(noun) · \(capture.context.source.rawValue)"
+        lastCaptureSummary = summary
+        lastCaptureItem?.title = summary
 
         let stub = CapturePrompt.clipboardStub(id: capture.id, note: capture.note)
         lastCapturePrompt = stub
@@ -741,7 +879,47 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
             }
         }
 
-        setStatus(title: "Lasso — last capture id \(capture.id)")
+        setStatus(title: "Lasso: last capture id \(capture.id)")
+    }
+
+    // MARK: - Capture feedback
+
+    /// Shows a progress state only after a short grace period. This avoids a
+    /// distracting flicker for fast captures while making a one-second capture
+    /// feel acknowledged instead of frozen.
+    private func beginCaptureFeedback() {
+        captureFeedbackWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.isCapturing else { return }
+            self.isPreparingCapture = true
+            self.preparingPulseOn = true
+            self.lastCaptureItem?.title = "Preparing capture"
+            self.captureFeedbackTimer?.invalidate()
+            let timer = Timer(timeInterval: Self.captureFeedbackPulseInterval, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.preparingPulseOn.toggle()
+                self.refreshStatusIcon()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.captureFeedbackTimer = timer
+            self.refreshStatusIcon()
+        }
+        captureFeedbackWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.captureFeedbackDelay, execute: workItem)
+    }
+
+    private func endCaptureFeedback() {
+        captureFeedbackWorkItem?.cancel()
+        captureFeedbackWorkItem = nil
+        captureFeedbackTimer?.invalidate()
+        captureFeedbackTimer = nil
+        guard isPreparingCapture || preparingPulseOn else { return }
+        isPreparingCapture = false
+        preparingPulseOn = false
+        if lastCaptureItem?.title == "Preparing capture" {
+            lastCaptureItem?.title = lastCaptureSummary
+        }
+        refreshStatusIcon()
     }
 
     /// Writes to the clipboard only — Lasso never sends synthetic keystrokes to
@@ -790,16 +968,20 @@ final class ConductorApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUse
         // "pending" and badge the icon red with nothing actually queued.
         let pending = pendingRequest != nil && pendingRequest?.id == surfacedRequestId
         let blocked = !hasScreenRecording
+        let preparing = isPreparingCapture
         let isDark = button.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let key = "\(pending)-\(blocked)-\(isDark)"
+        let key = "\(pending)-\(blocked)-\(preparing)-\(preparingPulseOn)-\(isDark)"
         if key != cachedIconKey {
-            cachedIcon = statusImage(pending: pending, blocked: blocked,
+            cachedIcon = statusImage(pending: pending, blocked: blocked, preparing: preparing,
+                                     pulseOn: preparingPulseOn,
                                      appearance: button.effectiveAppearance)
             cachedIconKey = key
         }
         button.image = cachedIcon
-        if pending, let pendingRequest {
-            button.toolTip = "Lasso — \(pendingRequest.requester) is asking for a capture"
+        if preparing {
+            button.toolTip = "Lasso: Preparing capture"
+        } else if pending, let pendingRequest {
+            button.toolTip = "Lasso: \(pendingRequest.requester) is asking for a capture"
         } else {
             button.toolTip = normalStatusTitle
         }

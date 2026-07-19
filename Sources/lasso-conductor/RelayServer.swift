@@ -59,7 +59,7 @@ final class RelayServer {
 
     private let publishedLock = NSLock()
     private var _extensionConnected = false
-    private var _statusSummary = "Browser relay starting…"
+    private var _statusSummary = "Browser relay starting"
 
     var hasConnectedExtension: Bool {
         publishedLock.lock()
@@ -98,6 +98,25 @@ final class RelayServer {
 
     func start() {
         queue.async { self.openListener() }
+    }
+
+    /// The library directory also owns the Unix socket consumed by the native
+    /// browser host. Stop before switching the library location so a fresh relay
+    /// can bind the new path without leaving a stale listener behind.
+    func stop() {
+        queue.sync { stopListener() }
+    }
+
+    private func stopListener() {
+        listenerSource?.cancel()
+        listenerSource = nil
+        if listenerFD >= 0 {
+            Darwin.close(listenerFD)
+            listenerFD = -1
+        }
+        _ = unlink(socketURL.path)
+        closeAllConnections()
+        publish(status: "Browser relay stopped")
     }
 
     private func openListener() {
@@ -156,7 +175,7 @@ final class RelayServer {
 
     private func listenerFailed(_ reason: String) {
         Self.log("relay failed to start at \(socketURL.path): \(reason)")
-        publish(status: "Browser relay unavailable — native messaging socket unavailable")
+        publish(status: "Browser relay unavailable: native messaging socket unavailable")
         closeAllConnections()
     }
 
@@ -180,12 +199,12 @@ final class RelayServer {
                 try self.keychain.removeAll()
             } catch {
                 Self.log("relay revoke failed: \(error)")
-                self.publish(status: "Browser relay — revoke failed (Keychain unavailable)")
+                self.publish(status: "Browser relay: revoke failed (Keychain unavailable)")
                 return
             }
             self.gate.revokeAll()
             self.closeAllConnections()
-            self.publish(status: "Browser relay ready — pairing revoked")
+            self.publish(status: "Browser relay ready: pairing revoked")
         }
     }
 
@@ -589,7 +608,7 @@ final class RelayServer {
             return true
         } catch {
             Self.log("relay Keychain write failed: \(error)")
-            publish(status: "Browser relay unavailable — Keychain error")
+            publish(status: "Browser relay unavailable: Keychain error")
             return false
         }
     }

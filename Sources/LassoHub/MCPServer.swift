@@ -26,11 +26,23 @@ public struct MCPServer {
     static let maxListLimit = 50
     static let maximumRequestBytes = 4 * 1024 * 1024
     static let maximumJSONDepth = 64
+    static let maximumImageLongSide = 1568
 
-    let storeDirectory: URL
+    private let storeDirectoryProvider: () -> URL
 
-    public init(storeDirectory: URL = Store.defaultDirectory()) {
-        self.storeDirectory = storeDirectory
+    /// The default resolver is deliberately evaluated for every tool call. A
+    /// running MCP stdio session therefore follows a library relocation without
+    /// needing to restart or accidentally recreating the previous store.
+    public init() {
+        storeDirectoryProvider = { Store.defaultDirectory() }
+    }
+
+    public init(storeDirectory: URL) {
+        storeDirectoryProvider = { storeDirectory }
+    }
+
+    init(storeDirectoryProvider: @escaping () -> URL) {
+        self.storeDirectoryProvider = storeDirectoryProvider
     }
 
     /// Reads bounded newline-delimited frames until stdin closes. Oversized
@@ -99,7 +111,7 @@ public struct MCPServer {
             return success(id, [
                 "protocolVersion": requested ?? Self.protocolVersion,
                 "capabilities": ["tools": [String: Any]()],
-                "serverInfo": ["name": "lasso-mcp", "version": "0.1.1"],
+                "serverInfo": ["name": "lasso-mcp", "version": "0.1.2"],
             ])
         case "notifications/initialized":
             return nil
@@ -129,7 +141,7 @@ public struct MCPServer {
                 + "`context` block (source is dom | ocr | accessibility | none; on web it includes "
                 + "a DOM fingerprint you can use to find the source file; screen OCR may include "
                 + "layout: code when identifiers and line structure were preserved), any user-dropped `markers` "
-                + "(numbered pins with normalized x/y and optional notes), `redaction_status`, and `age_seconds` — treat "
+                + "(numbered pins with normalized x/y and optional notes), `redaction_status`, and `age_seconds`. Treat "
                 + "a Capture older than a few minutes as possibly stale. Pass after_id to skip a "
                 + "Capture you have already seen; `latest_id` in the summary is always the newest id.",
             "inputSchema": [
@@ -170,8 +182,8 @@ public struct MCPServer {
         [
             "name": Self.listToolName,
             "description": "List recent Captures as compact metadata (id, age_seconds, note, context "
-                + "source, marker_count) with NO image bytes, newest first. Use this to orient — see "
-                + "what the user captured and detect ids you missed — then call get_capture(id) to pull "
+                + "source, marker_count) with NO image bytes, newest first. Use this to orient: see "
+                + "what the user captured and detect ids you missed, then call get_capture(id) to pull "
                 + "the pixels for the one you want.",
             "inputSchema": [
                 "type": "object",
@@ -230,28 +242,33 @@ public struct MCPServer {
         }
     }
 
-    /// Builds the MCP content blocks for the latest Capture from a single Store
-    /// read, so `latest_id` and the returned Capture always come from the same
-    /// snapshot even if a writer commits concurrently. When the Store is empty,
-    /// or the latest Capture is not newer than `afterId`, returns a single text
-    /// block whose JSON carries `capture: null` and the current `latest_id`.
+    /// Builds the MCP content blocks for the newest readable Capture. The newest
+    /// active id is preserved as `latest_id` even if its PNG is missing, while a
+    /// damaged file is skipped so one broken row does not disable the tool.
     private func latestCaptureContent(afterId: Int64?) throws -> [[String: Any]] {
-        guard let store = try openStoreForReading(), let latest = try store.latest() else {
+        guard let store = try openStoreForReading() else {
             return [summaryBlock(latestId: nil, capture: nil)]
         }
-        if let afterId, latest.id <= afterId {
-            return [summaryBlock(latestId: latest.id, capture: nil)]
+        let listing = try store.activeCaptureListSnapshot(afterId: afterId)
+        guard let latestId = listing.latestID else {
+            return [summaryBlock(latestId: nil, capture: nil)]
         }
-        let image = try store.imageData(for: latest)
-        guard image.count <= Store.maximumImageBytes else {
-            throw StoreError.imageRead("capture image exceeds the MCP size limit")
+        for candidate in listing.captures {
+            do {
+                guard let snapshot = try store.activeCaptureSnapshot(id: candidate.id).capture else {
+                    continue
+                }
+                let prepared = try imageBlock(for: snapshot.imagePNG)
+                return [prepared, summaryBlock(latestId: latestId, capture: snapshot.capture)]
+            } catch let error as StoreError {
+                guard case .imageRead = error else { throw error }
+            } catch MCPImagePreprocessorError.invalidPNG {
+                continue
+            } catch MCPImagePreprocessorError.thumbnailCreationFailed {
+                continue
+            }
         }
-        let imageBlock: [String: Any] = [
-            "type": "image",
-            "data": image.base64EncodedString(),
-            "mimeType": "image/png",
-        ]
-        return [imageBlock, summaryBlock(latestId: latest.id, capture: latest)]
+        return [summaryBlock(latestId: latestId, capture: nil)]
     }
 
     /// Builds the content blocks for a specific Capture id. `latest_id` always
@@ -262,25 +279,33 @@ public struct MCPServer {
         guard let store = try openStoreForReading() else {
             return [summaryBlock(latestId: nil, capture: nil)]
         }
-        // One read transaction so latest_id and the fetched Capture come from the
-        // same snapshot even if the Conductor writes/purges concurrently — same
-        // guarantee latestCaptureContent gets from its single latest() call.
-        let (latestId, capture) = try store.readTransaction {
-            (try store.latestId(), try store.capture(id: captureId))
+        let lookup = try store.activeCaptureSnapshot(id: captureId)
+        guard let snapshot = lookup.capture else {
+            return [summaryBlock(latestId: lookup.latestID, capture: nil)]
         }
-        guard let capture else {
-            return [summaryBlock(latestId: latestId, capture: nil)]
-        }
-        let image = try store.imageData(for: capture)
+        return [try imageBlock(for: snapshot.imagePNG),
+                summaryBlock(latestId: lookup.latestID, capture: snapshot.capture)]
+    }
+
+    /// Builds the one image content block shared by both capture-fetching tools.
+    /// The Store remains the full-resolution source of truth; only the bytes sent
+    /// over MCP are capped to a token-conscious long-side budget.
+    private func imageBlock(for image: Data) throws -> [String: Any] {
         guard image.count <= Store.maximumImageBytes else {
             throw StoreError.imageRead("capture image exceeds the MCP size limit")
         }
-        let imageBlock: [String: Any] = [
+        let prepared = try MCPImagePreprocessor.preparePNG(
+            image,
+            maximumLongSide: Self.maximumImageLongSide
+        )
+        guard prepared.count <= Store.maximumImageBytes else {
+            throw StoreError.imageRead("prepared capture image exceeds the MCP size limit")
+        }
+        return [
             "type": "image",
-            "data": image.base64EncodedString(),
+            "data": prepared.base64EncodedString(),
             "mimeType": "image/png",
         ]
-        return [imageBlock, summaryBlock(latestId: latestId, capture: capture)]
     }
 
     /// Builds a single text block listing recent Captures as metadata only (no
@@ -289,18 +314,15 @@ public struct MCPServer {
         guard let store = try openStoreForReading() else {
             return [listBlock(latestId: nil, captures: [])]
         }
-        // Single snapshot for latest_id + the listing (see getCaptureContent).
-        let (latestId, captures) = try store.readTransaction {
-            (try store.latestId(), try store.recent(limit: limit))
-        }
-        return [listBlock(latestId: latestId, captures: captures)]
+        let snapshot = try store.activeCaptureListSnapshot(limit: limit)
+        return [listBlock(latestId: snapshot.latestID, captures: snapshot.captures)]
     }
 
     /// Records a pending intent in the separate requests table. This path has no
     /// reference to AppKit or the Overlay and does not call the Capture writer;
     /// the human remains the sole trigger of an actual Capture.
     private func requestCaptureContent() throws -> [[String: Any]] {
-        let store = try Store(directory: storeDirectory, access: .requestWriter)
+        let store = try Store(directory: storeDirectoryProvider(), access: .requestWriter)
         let requester = "lasso-mcp (PID \(ProcessInfo.processInfo.processIdentifier))"
         let request = try store.insertRequest(requester: requester)
         return [[
@@ -392,6 +414,7 @@ public struct MCPServer {
     /// Conductor may not have written anything). A missing Store is "empty",
     /// not an error.
     private func openStoreForReading() throws -> Store? {
+        let storeDirectory = storeDirectoryProvider()
         let dbPath = storeDirectory.appendingPathComponent("store.sqlite3")
         guard FileManager.default.fileExists(atPath: dbPath.path) else { return nil }
         return try Store(directory: storeDirectory, access: .reader)

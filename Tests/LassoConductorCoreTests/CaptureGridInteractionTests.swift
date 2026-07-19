@@ -34,6 +34,20 @@ final class CaptureGridInteractionTests: XCTestCase {
         XCTAssertEqual(result.selection, [second])
     }
 
+    func testCommandClickCanDeselectTheLastSelectedCapture() {
+        let first = IndexPath(item: 0, section: 0)
+
+        let result = CaptureGridInteraction.resolve(
+            current: [first],
+            clicked: first,
+            modifiers: [.command],
+            clickCount: 1
+        )
+
+        XCTAssertTrue(result.selection.isEmpty)
+        XCTAssertNil(result.openItem)
+    }
+
     func testDoubleClickOpensItemWithoutDestroyingItsBatchSelection() {
         let first = IndexPath(item: 0, section: 0)
         let second = IndexPath(item: 1, section: 0)

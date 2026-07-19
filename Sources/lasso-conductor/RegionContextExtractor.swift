@@ -69,7 +69,7 @@ enum RegionContextExtractor {
     /// snake_case signals needed to recognize code. The pure classifier inspects
     /// the uncorrected observations; prose still selects corrected text, while
     /// code selects the indentation-preserving pass with corrected text fallback.
-    static func recognize(_ image: CGImage) throws -> RegionOCRResult {
+    nonisolated static func recognize(_ image: CGImage) throws -> RegionOCRResult {
         let uncorrected = try performOCR(
             image,
             usesLanguageCorrection: false,
@@ -92,7 +92,7 @@ enum RegionContextExtractor {
         )
     }
 
-    private static func performOCR(
+    nonisolated private static func performOCR(
         _ image: CGImage,
         usesLanguageCorrection: Bool,
         preserveIndentation: Bool
@@ -121,7 +121,7 @@ enum RegionContextExtractor {
 
     /// Vision returns line boxes but not leading spaces. For code OCR, infer
     /// indentation from each normalized left edge and the median glyph width.
-    private static func indentedLines(_ lines: [(String, CGRect)]) -> [String] {
+    nonisolated private static func indentedLines(_ lines: [(String, CGRect)]) -> [String] {
         guard let leftEdge = lines.map({ $0.1.minX }).min() else { return [] }
         let widths = lines.compactMap { text, box -> CGFloat? in
             let count = text.count

@@ -25,7 +25,7 @@ VERSION="$(tr -d '\r\n' < "$ROOT/VERSION")"
 BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "error: VERSION must be a semantic version (for example 0.1.1)" >&2
+    echo "error: VERSION must be a semantic version (for example 0.1.2)" >&2
     exit 1
 fi
 
@@ -86,7 +86,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Lasso — local spatial context for coding agents.</string>
+    <string>Lasso: local spatial context for coding agents.</string>
 </dict>
 </plist>
 PLIST
@@ -165,7 +165,7 @@ esac
 if [ "$IS_DEVELOPER_ID" = true ]; then
     echo "Gatekeeper assessment:"
     spctl --assess --type exec --verbose=4 "$APP" 2>&1 || \
-        echo "  (not yet accepted — notarize + staple for distribution)"
+        echo "  (not yet accepted; notarize and staple for distribution)"
 fi
 
 echo "Built $APP  (signed by: $IDENTITY)"

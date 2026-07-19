@@ -9,7 +9,7 @@ Lasso does not continuously record the screen and never pushes a capture to an
 agent by itself: the user captures deliberately, then the agent explicitly asks
 for the newest capture over MCP.
 
-![Lasso showing a rectangular capture with numbered pins, a capture note, tags, and local context.](https://github.com/user-attachments/assets/60477c93-9001-4f18-85e4-42df2421d920)
+![Lasso showing a rectangular capture with numbered pins, a capture note, tags, and local context.](site/assets/screenshots/lasso-capture-detail.jpg)
 
 ## Requirements
 
@@ -24,7 +24,7 @@ for the newest capture over MCP.
 2. Unzip it, move `Lasso.app` to `/Applications`, and open it.
 3. Accept Screen Recording when macOS asks. Lasso opens its guided setup, where
    you can copy the MCP command for your client.
-4. Use the default `Option-Space` shortcut, then drag a rectangle around the
+4. Use the default `Control-Option-Space` shortcut, then drag a rectangle around the
    area you want the agent to see.
 
 The release bundle includes the `lasso-mcp` executable used by the setup flow;
