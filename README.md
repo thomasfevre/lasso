@@ -9,7 +9,7 @@ Lasso does not continuously record the screen and never pushes a capture to an
 agent by itself: the user captures deliberately, then the agent explicitly asks
 for the newest capture over MCP.
 
-![Lasso showing a rectangular capture with numbered pins, a capture note, tags, and local context.](site/assets/screenshots/lasso-capture-detail.jpg)
+![Lasso showing a rectangular capture with numbered pins, a capture note, tags, and local context.](https://github.com/user-attachments/assets/60477c93-9001-4f18-85e4-42df2421d920)
 
 ## Requirements
 
